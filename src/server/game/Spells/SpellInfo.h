@@ -22,6 +22,7 @@
 #include "Object.h"
 #include "SharedDefines.h"
 #include "SpellAuraDefines.h"
+#include <array>
 #include <boost/container/flat_set.hpp>
 #include "Util.h"
 
@@ -360,12 +361,26 @@ public:
     bool UsesMaxManaForCost = false;
     bool AscensionIgnoreAbsorbAndResistance = false;
     bool AscensionIgnoreAbsorb = false;
+    bool AscensionTargetAuraStateOnlyPrimary = false;
     bool AscensionInheritsResolvedAmount = false;
+    bool AscensionInheritsPowerScaling = false;
+    bool AscensionFlatAfterWeaponPercent = false;
+    // Every SpellCustomAttributes bit is taken; a stealth aura with this set is kept when a hostile spell hits.
+    bool StealthSurvivesSpellHits = false;
     // Runtime-only opt-in for explicitly authored coefficients. Rank base
     // growth still uses the original SpellLevel and MaxLevel metadata.
     bool IgnoreSpellLevelPenalty = false;
-    uint32 Stances;
-    uint32 StancesNot;
+    // Ascension finishers scale with (AP + SP) * (square * cp * cp + flat) per effect (Eviscerate's
+    // "(AP+SP)*5*5*0.02"); when set, it replaces the stock per-combo-point attack power part.
+    std::array<float, MAX_SPELL_EFFECTS> ComboPointPowerSquare = {};
+    std::array<float, MAX_SPELL_EFFECTS> ComboPointPowerFlat = {};
+    [[nodiscard]] bool HasComboPointPowerBonus(uint8 effIndex) const
+    {
+        return ComboPointPowerSquare[effIndex] != 0.0f || ComboPointPowerFlat[effIndex] != 0.0f;
+    }
+    int32 GetComboPointPowerBonus(Unit* caster, uint8 effIndex, uint32 comboPoints) const;
+    uint64 Stances;
+    uint64 StancesNot;
     uint32 Targets;
     uint32 TargetCreatureType;
     uint32 RequiresSpellFocus;
@@ -598,5 +613,20 @@ public:
     std::array<SpellEffectInfo, MAX_SPELL_EFFECTS>& _GetEffects() { return Effects; }
     SpellEffectInfo& _GetEffect(SpellEffIndex index) { ASSERT(index < Effects.size()); return Effects[index]; }
 };
+
+// Ascension's Reach talents: a range bonus for every damaging spell of the owner, with no class mask or SpellAffect.dbc
+// row, that "does not stack with other similar effects"
+namespace AscensionReach
+{
+    // "Increases the range of your damaging spells by $s1 yards": an unmasked range modifier
+    inline constexpr std::array<uint32, 7> DamagingSpells = { 11100, 12353, 812352, 28999, 29000, 829000, 816758 };
+    // "Increases the range of your damaging spells with a channeling or cast time by $s1 yards": an unmasked EFFECT1
+    // modifier, carried as a range modifier (SpellInfoCorrections; Arcane Subtlety rank 3's is a dummy, converted by
+    // AscensionDummyFixMage)
+    inline constexpr std::array<uint32, 20> CastTimeSpells = { 11211, 812592, 12219, 12220, 12221, 16819, 16820, 816819,
+        17322, 17323, 817323, 17917, 17918, 817918, 18218, 18219, 818219, 27789, 27790, 827790 };
+
+    AC_GAME_API bool IsReachModifier(SpellModifier const* mod);
+}
 
 #endif // _SPELLINFO_H

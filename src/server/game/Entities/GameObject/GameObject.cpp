@@ -892,7 +892,7 @@ void GameObject::Update(uint32 diff)
                 m_respawnTime = GameTime::GetGameTime().count() + dynamicRespawnDelay;
 
                 // if option not set then object will be saved at grid unload
-                if (GetMap()->IsDungeon())
+                if (GetMap()->IsDungeon() || sWorld->getBoolConfig(CONFIG_SAVE_RESPAWN_TIME_IMMEDIATELY))
                     SaveRespawnTime();
 
                 DestroyForVisiblePlayers(); // xinef: old UpdateObjectVisibility();
@@ -1310,6 +1310,10 @@ void GameObject::Respawn()
 
 bool GameObject::ActivateToQuest(Player* target) const
 {
+    if (GameObjectAI* ai = AI())
+        if (!ai->CanActivateToQuest(target))
+            return false;
+
     if (target->HasQuestForGO(GetEntry()))
         return true;
 
@@ -1458,6 +1462,27 @@ void GameObject::SwitchDoorOrButton(bool activate, bool alternative /* = false *
         SetGoState(alternative ? GO_STATE_ACTIVE_ALTERNATIVE : GO_STATE_ACTIVE);
     else                                                    //if open -> close
         SetGoState(GO_STATE_READY);
+}
+
+namespace
+{
+bool SpellTargetsGameObject(SpellInfo const* spellInfo)
+{
+    for (SpellEffectInfo const& effect : spellInfo->Effects)
+    {
+        if (!effect.Effect)
+            continue;
+
+        for (SpellImplicitTargetInfo const& target : { effect.TargetA, effect.TargetB })
+        {
+            SpellTargetObjectTypes objectType = target.GetObjectType();
+            if (objectType == TARGET_OBJECT_TYPE_GOBJ || objectType == TARGET_OBJECT_TYPE_GOBJ_ITEM)
+                return true;
+        }
+    }
+
+    return false;
+}
 }
 
 void GameObject::Use(Unit* user)
@@ -1775,6 +1800,9 @@ void GameObject::Use(Unit* user)
                             // but you will likely cause junk in areas that require a high fishing skill (not yet implemented)
                             if (chance >= roll)
                             {
+                                uint32 const requiredSkill = std::max(0, zoneSkill);
+                                player->RewardProfessionXP(SKILL_FISHING, skill, requiredSkill + 100,
+                                    requiredSkill + 50, requiredSkill + 25);
                                 // Keep the bobber owned while loot is open, but clear the
                                 // spell id so finishing the fishing channel does not delete it.
                                 SetSpellId(0); // prevent removing unintended auras at Unit::RemoveGameObject
@@ -1837,7 +1865,10 @@ void GameObject::Use(Unit* user)
                 {
                     Player* ritualOwner = ObjectAccessor::GetPlayer(*this, m_ritualOwnerGUID);
                     if (!ritualOwner)
-                        return;
+                    {
+                        m_ritualOwnerGUID = player->GetGUID();
+                        ritualOwner = player;
+                    }
                     if (player != ritualOwner && (info->summoningRitual.castersGrouped && !player->IsInSameRaidWith(ritualOwner)))
                         return;
                 }
@@ -2073,7 +2104,13 @@ void GameObject::Use(Unit* user)
 
     if (spellCaster)
     {
-        if ((spellCaster->CastSpell(user, spellInfo, TriggerCastFlags(triggeredFlags)) == SPELL_CAST_OK) && GetGoType() == GAMEOBJECT_TYPE_SPELLCASTER)
+        // A goober whose spell asks for a gameobject target casts at the object itself,
+        // so the object takes the hit and its AI sees the completed cast.
+        SpellCastResult castResult = (GetGoType() == GAMEOBJECT_TYPE_GOOBER && SpellTargetsGameObject(spellInfo))
+            ? spellCaster->CastSpell(this, spellId, false)
+            : spellCaster->CastSpell(user, spellInfo, TriggerCastFlags(triggeredFlags));
+
+        if (castResult == SPELL_CAST_OK && GetGoType() == GAMEOBJECT_TYPE_SPELLCASTER)
             AddUse();
     }
     else

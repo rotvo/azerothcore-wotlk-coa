@@ -1,8 +1,14 @@
 // mod-coa-challenges (review split): CoA.Challenges.Lifecycle.cpp
 // Mechanical split of review-CoAChallenges.cpp; no logic changes.
 #include "CoA.Challenges.Review.h"
+#include "AscensionRulesets.h"
+#include "InstanceScript.h"
+#include "ObjectMgr.h"
 
 #include <atomic>
+#include <mutex>
+#include <optional>
+#include <unordered_map>
 
 namespace CoAChallenges
 {
@@ -25,6 +31,15 @@ namespace CoAChallenges
         return false;
     }
 
+    // True when the character can never activate another challenge anyway (a
+    // recorded failure under BlockAllAfterFailure), so recording a condition
+    // flag would be pointless.
+    bool ActivationPermanentlyBlocked(uint32 guid)
+    {
+        return sConfigMgr->GetOption<bool>("CoAChallenges.BlockAllAfterFailure", true)
+            && HasAnyFailure(guid);
+    }
+
     bool HasCompletion(uint32 guid, uint32 challengeID)
     {
         if (QueryResult r = CharacterDatabase.Query(
@@ -41,6 +56,15 @@ namespace CoAChallenges
                 guid, challengeID, level))
             return true;
         return false;
+    }
+
+    bool HasAccountCompletionLevel(uint32 account, uint32 challengeID, uint32 level)
+    {
+        auto* statement = CharacterDatabase.GetPreparedStatement(CHAR_SEL_COA_ACCOUNT_CHALLENGE_COMPLETION);
+        statement->SetData(0, account);
+        statement->SetData(1, challengeID);
+        statement->SetData(2, level);
+        return CharacterDatabase.Query(statement) != nullptr;
     }
 
     // Death update (SMSG 0x5A6): same 26-byte active-entry layout as 0x596,
@@ -113,7 +137,7 @@ namespace CoAChallenges
             "CoAChallenges.RequiredGameMode." + std::to_string(challengeID), 0);
     }
 
-    // Game modes are NOT player-toggleable (SendConfigBatch locks the UI): the
+    // Game modes are NOT player-toggleable (AppendClientConfig locks the UI): the
     // bitmask is derived from the active challenges' RequiredGameMode. So a
     // trial that "is" a game mode (e.g. 61 -> Nightmare 0x100) turns the mode
     // on while active and off when it stops/fails/completes.
@@ -121,17 +145,18 @@ namespace CoAChallenges
     {
         if (!player)
             return;
+        RecomputeRequiredGameModes(player, LoadActiveChallengeRows(player->GetGUID().GetCounter()));
+    }
+
+    void RecomputeRequiredGameModes(Player* player, std::vector<ActiveChallengeRow> const& rows)
+    {
+        if (!player)
+            return;
         uint32 guid = player->GetGUID().GetCounter();
 
-        uint32 mask = 0;
-        if (QueryResult r = CharacterDatabase.Query(
-                "SELECT challengeId FROM coa_character_challenge WHERE guid = {}", guid))
-        {
-            do
-            {
-                mask |= RequiredGameMode(r->Fetch()[0].Get<uint32>());
-            } while (r->NextRow());
-        }
+        uint32 mask = RealmGameModeMask();
+        for (ActiveChallengeRow const& row : rows)
+            mask |= RequiredGameMode(row.challengeId);
 
         // Preserve genuinely player-toggled modes (testing flag): without this a
         // login/activate recompute would silently clear them.
@@ -230,10 +255,15 @@ namespace CoAChallenges
         // DB rows.
         CharacterDatabase.DirectExecute("DELETE FROM coa_character_challenge WHERE guid = {}", guid);
         ClearCharChallengeCache(guid);
+        RefreshLevelScalingTracking(player);
         CharacterDatabase.DirectExecute("DELETE FROM coa_character_objective WHERE guid = {}", guid);
         CharacterDatabase.DirectExecute("DELETE FROM coa_challenge_completion WHERE guid = {}", guid);
         CharacterDatabase.DirectExecute("DELETE FROM coa_challenge_failure WHERE guid = {}", guid);
+        auto* snapshots = CharacterDatabase.GetPreparedStatement(CHAR_DEL_COA_CHALLENGE_FAILURE_SNAPSHOTS);
+        snapshots->SetData(0, guid);
+        CharacterDatabase.DirectExecute(snapshots);
         CharacterDatabase.DirectExecute("DELETE FROM coa_character_condition WHERE guid = {}", guid);
+        ResetConditionFlags(guid);
         CharacterDatabase.DirectExecute("DELETE FROM coa_character_gamemode WHERE guid = {}", guid);
         CharacterDatabase.DirectExecute("DELETE FROM coa_character_gamemode_lives WHERE guid = {}", guid);
         CharacterDatabase.DirectExecute("DELETE FROM coa_character_survival WHERE guid = {}", guid);
@@ -353,12 +383,42 @@ namespace CoAChallenges
         return false;
     }
 
+    bool AdventureModeChangeBlocked(Player* player)
+    {
+        auto fighting = [](Player* member)
+        {
+            if (member->IsInCombat())
+                return true;
+            for (Unit* controlled : member->m_Controlled)
+                if (controlled && controlled->IsInCombat())
+                    return true;
+            return false;
+        };
+        bool blocked = !player->IsAlive() || player->IsBeingTeleported() || player->IsInFlight()
+            || player->IsCharmed() || fighting(player);
+        if (!player->FindMap())
+            blocked = true;
+        else if (InstanceScript* instance = player->GetInstanceScript())
+            blocked = blocked || instance->IsEncounterInProgress();
+        if (Group* group = player->GetGroup())
+            for (GroupReference* member = group->GetFirstMember(); member; member = member->next())
+                if (Player* participant = member->GetSource())
+                    blocked = blocked || fighting(participant);
+        if (blocked)
+            ChatHandler(player->GetSession()).SendSysMessage(
+                "Adventure Mode cannot change during combat, an encounter, death, flight, control or teleportation. "
+                "Your party and pets must also be out of combat.");
+        return blocked;
+    }
+
     // ---- Challenge activation (shared by StartChallenge and ActivateTrial) --
     // Validates one challenge against the client's activation rules. Returns the
     // Enum.ChallengeResponse code (0 = OK, 1..14 = reason). Sends a chat hint
     // for every rejection so the player always sees WHY activation failed.
     uint32 ValidateChallenge(Player* player, uint32 challengeID, uint32 level)
     {
+        if ((challengeID == 211 || challengeID == 425) && AdventureModeChangeBlocked(player))
+            return 8;
         uint32 guid = player->GetGUID().GetCounter();
 
         if (!ChallengeExists(challengeID))                       // 1 NOT_FOUND
@@ -418,21 +478,20 @@ namespace CoAChallenges
             }
         }
         // HIGH_RISK_ONLY (High Roller / Ironman - High-Risk): the character must
-        // be in the High Risk ruleset (aura applied by mod-ascension-compat).
+        // be in the High Risk ruleset (aura applied by CoA).
         if (CoAParse::ListContains(ChallengeRules(challengeID), "CHALLENGE_RULES_TYPE_HIGH_RISK_ONLY")
-            && HighRiskActivationBlocked(player))
+            && HighRiskActivationBlocked(player)
+            && !(IsTrialChallenge(challengeID)
+                && AscensionRulesets::CanApply(player, AscensionRulesets::Ruleset::HighRisk, true)))
         {
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "{} requires you to be in High Risk.", ChallengeName(challengeID));
             return 12; // RULE_BROKEN
         }
-        if (ChallengeLevelCount(challengeID) > 1 && level > 1
-            && !HasCompletionLevel(guid, challengeID, level - 1))
-        {                                                        // 9 PREVIOUS_LEVEL_NOT_COMPLETED
-            ChatHandler(player->GetSession()).PSendSysMessage(
-                "Complete the previous level of {} first.", ChallengeName(challengeID));
-            return 9;
-        }
+        // Multi-level challenges are difficulty picks, not a ladder: any level can be
+        // entered straight away (Adventure Mode at level 30 without ever completing
+        // level 1, as on Ascension). Levels are not shortcuts either - rewards are paid
+        // per completed (challenge, level) row, so entering high only buys a harder fight.
         if (IsPrestigeChallenge(challengeID) && !IsPrestiged(player))  // 11 NOT_PRESTIGE
         {
             ChatHandler(player->GetSession()).PSendSysMessage("{} requires prestige.", ChallengeName(challengeID));
@@ -515,6 +574,7 @@ namespace CoAChallenges
             "REPLACE INTO coa_character_challenge (guid, challengeId, level, deaths, hunger, thirst, startTime) "
             "VALUES ({}, {}, {}, 0, 0, 0, UNIX_TIMESTAMP())",
             guid, challengeID, level);
+        ForgetFailureSnapshot(guid, challengeID);
         ClearCharChallengeCache(guid);
         ApplyChallengeSpell(player, challengeID, level);
         TrackHunger(player, challengeID);
@@ -523,6 +583,7 @@ namespace CoAChallenges
         TrackInvertedBreath(player, challengeID);
         RefreshRegenTracking(player);
         RefreshHighRiskTracking(player);
+        RefreshLevelScalingTracking(player);
         RefreshLootedTracking(player);
         RecomputeRequiredGameModes(player);
         EnforceGroupOnActivation(player);
@@ -547,9 +608,50 @@ namespace CoAChallenges
         BroadcastChallengeSync(player, challengeID, level, false);
     }
 
+    uint32 LowerAdventureModeLevel(Player* player, uint32 challengeID, uint32 level)
+    {
+        uint32 const guid = player->GetGUID().GetCounter();
+        uint32 const current = ActiveChallengeLevel(guid, challengeID);
+        if ((challengeID != 211 && challengeID != 425) || !ActiveChallenges(guid).contains(challengeID)
+            || !level || level >= current || level > ChallengeLevelCount(challengeID))
+        {
+            ChatHandler(player->GetSession()).SendSysMessage("Choose a lower Adventure Mode level, at least 1.");
+            return 4;
+        }
+        if (AdventureModeChangeBlocked(player))
+            return 8;
+        if (!GetActiveCustomTrial(guid).empty() || HasCompletionLevel(guid, challengeID, level))
+        {
+            ChatHandler(player->GetSession()).SendSysMessage(
+                "Cannot lower a custom trial or select an Adventure Mode level already completed.");
+            return 12;
+        }
+
+        auto* update = CharacterDatabase.GetPreparedStatement(CHAR_UPD_COA_ADVENTURE_LEVEL);
+        update->SetData(0, level);
+        update->SetData(1, guid);
+        update->SetData(2, challengeID);
+        CharacterDatabase.DirectExecute(update);
+        ClearCharChallengeCache(guid);
+        RemoveChallengeSpell(player, challengeID);
+        ApplyChallengeSpell(player, challengeID, level);
+        player->RefreshQuestLogQueries();
+        RefreshLevelScalingTracking(player);
+        SendActiveList(player);
+        SendCriteriaState(player);
+        BroadcastChallengeSync(player, challengeID, level, false);
+        ChatHandler(player->GetSession()).PSendSysMessage(
+            "Adventure Mode reduced to level {}. Difficulty and rewards now use this level.", level);
+        return 0;
+    }
+
     // Validate + activate a single challenge. Returns 0 on success.
     uint32 ActivateChallenge(Player* player, uint32 challengeID, uint32 level)
     {
+        if ((challengeID == 211 || challengeID == 425)
+            && ActiveChallenges(player->GetGUID().GetCounter()).contains(challengeID))
+            return LowerAdventureModeLevel(player, challengeID, level);
+
         uint32 code = ValidateChallenge(player, challengeID, level);
         if (code)
             return code;
@@ -577,6 +679,7 @@ namespace CoAChallenges
         UntrackInvertedBreath(player);
         RefreshRegenTracking(player);
         RefreshHighRiskTracking(player);
+        RefreshLevelScalingTracking(player);
         RefreshLootedTracking(player);
         RecomputeRequiredGameModes(player);
 
@@ -626,6 +729,23 @@ namespace CoAChallenges
             } while (r->NextRow());
         }
         return active;
+    }
+
+    // Every column the login state needs, read in one query. PushLoginState hands the same rows to
+    // each consumer and seeds the cache with them, instead of querying the table once per consumer.
+    std::vector<ActiveChallengeRow> LoadActiveChallengeRows(uint32 guid)
+    {
+        std::vector<ActiveChallengeRow> rows;
+        if (QueryResult r = CharacterDatabase.Query(
+                "SELECT challengeId, level, hunger, thirst FROM coa_character_challenge WHERE guid = {}", guid))
+        {
+            do
+            {
+                Field* f = r->Fetch();
+                rows.push_back({ f[0].Get<uint32>(), f[1].Get<uint32>(), f[2].Get<int32>(), f[3].Get<int32>() });
+            } while (r->NextRow());
+        }
+        return rows;
     }
 
     // Test seam (`.coa cachetoctou`, see CoAChallengeTests.cpp). The hook runs on the calling
@@ -695,6 +815,67 @@ namespace CoAChallenges
         }
     }
 
+    // Read before loading rows for SeedCharChallengeCache, so an invalidation in between is detected.
+    uint64 CharChallengeCacheGeneration()
+    {
+        std::lock_guard<std::mutex> lock(CharChallengeMutex);
+        return CharChallengeGeneration;
+    }
+
+    // Publishes rows the caller loaded after reading CharChallengeCacheGeneration: never over an
+    // existing entry, and not at all once the generation has moved on.
+    void SeedCharChallengeCache(uint32 guid, uint64 generation, std::vector<ActiveChallengeRow> const& rows)
+    {
+        std::vector<std::pair<uint32, uint32>> active;
+        active.reserve(rows.size());
+        for (ActiveChallengeRow const& row : rows)
+            active.emplace_back(row.challengeId, row.level);
+
+        std::lock_guard<std::mutex> lock(CharChallengeMutex);
+        if (CharChallengeGeneration != generation)
+            return;
+        CharChallengeCache.try_emplace(guid, std::move(active));
+    }
+
+    // Rows read while the character loads (Player::LoadFromDB), kept for PushLoginState in the same
+    // login together with the cache generation they were read under. Any invalidation since then
+    // means a module write may have changed them, and PushLoginState reads the table again.
+    std::mutex LoginChallengeRowsMutex;
+    std::unordered_map<uint32, std::pair<uint64, std::vector<ActiveChallengeRow>>> LoginChallengeRows;
+
+    void PreloadLoginChallengeRows(uint32 guid)
+    {
+        uint64 const generation = CharChallengeCacheGeneration();
+        std::vector<ActiveChallengeRow> rows = LoadActiveChallengeRows(guid);
+        SeedCharChallengeCache(guid, generation, rows);
+        std::lock_guard<std::mutex> lock(LoginChallengeRowsMutex);
+        LoginChallengeRows[guid] = { generation, std::move(rows) };
+    }
+
+    std::vector<ActiveChallengeRow> TakeLoginChallengeRows(uint32 guid)
+    {
+        std::optional<std::pair<uint64, std::vector<ActiveChallengeRow>>> preloaded;
+        {
+            std::lock_guard<std::mutex> lock(LoginChallengeRowsMutex);
+            if (auto node = LoginChallengeRows.extract(guid))
+                preloaded = std::move(node.mapped());
+        }
+
+        uint64 const generation = CharChallengeCacheGeneration();
+        if (preloaded && preloaded->first == generation)
+            return std::move(preloaded->second);
+
+        std::vector<ActiveChallengeRow> rows = LoadActiveChallengeRows(guid);
+        SeedCharChallengeCache(guid, generation, rows);
+        return rows;
+    }
+
+    void ForgetLoginChallengeRows(uint32 guid)
+    {
+        std::lock_guard<std::mutex> lock(LoginChallengeRowsMutex);
+        LoginChallengeRows.erase(guid);
+    }
+
     // Called wherever the module adds or removes a row of coa_character_challenge, and at logout.
     void ClearCharChallengeCache(uint32 guid)
     {
@@ -716,6 +897,13 @@ namespace CoAChallenges
     bool ChallengesEnabled()
     {
         return ChallengesEnabledSetting.load(std::memory_order_relaxed);
+    }
+
+    // Implicit global activation gate (#4205 family): OUTSIDE_INTERACTION.
+    // Default on; lets an operator disable the whole gate without a rebuild.
+    bool OutsideInteractionGateEnabled()
+    {
+        return sConfigMgr->GetOption<bool>("CoAChallenges.OutsideInteractionGate", true);
     }
 
     bool PlayerHasRule(Player* player, char const* rule)
@@ -775,28 +963,168 @@ namespace CoAChallenges
         return out;
     }
 
+    // True while the player holds a trial. Activation conditions act only up to
+    // the trial being activated; interactions during the trial must not taint
+    // the next activation (rules cover the "during" window instead).
+    bool HasActiveTrial(uint32 guid)
+    {
+        for (auto const& [cid, unusedLevel] : CachedCharChallenges(guid))
+            if (IsTrialChallenge(cid))
+                return true;
+        return false;
+    }
+
     // ---- Activation conditions -------------------------------------------
     // Per-challenge conditions are generated into CoAChallenges.Conditions.<id>
     // as "TYPE:V1/V2/V3;...". A condition is false by default and becomes
     // "broken" (blocking activation) when the player violates it. Loot/level
     // flags persist per character; group/inventory are checked live.
 
+    // Condition flags are cached per character and written through. The
+    // INSERT is asynchronous, so reading the table back could miss a flag an
+    // earlier hook just set (loot, then start a trial before the queue drains);
+    // the cache is the authority once a character's rows have been loaded.
+    namespace
+    {
+        std::mutex ConditionFlagMutex;
+        std::unordered_map<uint32, std::set<std::string>> ConditionFlagCache;
+
+        // Caller holds ConditionFlagMutex.
+        std::set<std::string>& LoadedConditionFlags(uint32 guid)
+        {
+            auto [itr, inserted] = ConditionFlagCache.try_emplace(guid);
+            if (inserted)
+                if (QueryResult r = CharacterDatabase.Query(
+                        "SELECT flag FROM coa_character_condition WHERE guid = {}", guid))
+                {
+                    do { itr->second.insert(r->Fetch()[0].Get<std::string>()); } while (r->NextRow());
+                }
+            return itr->second;
+        }
+    }
+
     void SetConditionFlag(uint32 guid, char const* flag)
     {
         std::string eflag = flag ? flag : "";
+        {
+            std::lock_guard<std::mutex> lock(ConditionFlagMutex);
+            if (!LoadedConditionFlags(guid).insert(eflag).second)
+                return;
+        }
         CharacterDatabase.EscapeString(eflag);
         CharacterDatabase.Execute(
             "INSERT IGNORE INTO coa_character_condition (guid, flag) VALUES ({}, '{}')",
             guid, eflag);
     }
 
+    void ClearConditionFlag(uint32 guid, std::string const& flag)
+    {
+        {
+            std::lock_guard<std::mutex> lock(ConditionFlagMutex);
+            LoadedConditionFlags(guid).erase(flag);
+        }
+        std::string eflag = flag;
+        CharacterDatabase.EscapeString(eflag);
+        CharacterDatabase.Execute(
+            "DELETE FROM coa_character_condition WHERE guid = {} AND flag = '{}'", guid, eflag);
+    }
+
+    // The character's rows were deleted: it has no flags from now on.
+    void ResetConditionFlags(uint32 guid)
+    {
+        std::lock_guard<std::mutex> lock(ConditionFlagMutex);
+        ConditionFlagCache[guid].clear();
+    }
+
+    // The character itself was deleted: drop its entry.
+    void ForgetConditionFlags(uint32 guid)
+    {
+        std::lock_guard<std::mutex> lock(ConditionFlagMutex);
+        ConditionFlagCache.erase(guid);
+    }
+
     bool HasConditionFlag(uint32 guid, char const* flag)
     {
-        std::string eflag = flag ? flag : "";
-        CharacterDatabase.EscapeString(eflag);
-        return (bool)CharacterDatabase.Query(
-            "SELECT 1 FROM coa_character_condition WHERE guid = {} AND flag = '{}' LIMIT 1",
-            guid, eflag);
+        std::lock_guard<std::mutex> lock(ConditionFlagMutex);
+        return LoadedConditionFlags(guid).count(flag ? flag : "") != 0;
+    }
+
+    // Every condition flag for a character.
+    std::set<std::string> ConditionFlags(uint32 guid)
+    {
+        std::lock_guard<std::mutex> lock(ConditionFlagMutex);
+        return LoadedConditionFlags(guid);
+    }
+
+    // Human label for an OUTSIDE_INTERACTION facet flag (nullptr = not one).
+    // OUTSIDE_INTERACTION is the legacy aggregate flag (kept for old rows).
+    char const* OutsideFacetLabel(std::string const& flag)
+    {
+        if (flag == "OUTSIDE_MAIL")        return "taken items or money from the mailbox";
+        if (flag == "OUTSIDE_TRADE")       return "traded with another player";
+        if (flag == "OUTSIDE_AH")          return "used the auction house";
+        if (flag == "OUTSIDE_VENDOR")      return "used a vendor";
+        if (flag == "OUTSIDE_GUILD_BANK")  return "withdrawn from the guild bank";
+        if (flag == "OUTSIDE_BANK")        return "withdrawn from your bank";
+        if (flag == "OUTSIDE_REALM_BANK")  return "withdrawn from your realm bank";
+        if (flag == "OUTSIDE_INTERACTION") return "interacted with the outside world";
+        return nullptr;
+    }
+
+    // Every facet OUTSIDE_INTERACTION aggregates (the trailing entry is the
+    // legacy aggregate flag, kept for rows written before the per-facet split).
+    std::vector<char const*> AllOutsideFacets()
+    {
+        return { "OUTSIDE_MAIL", "OUTSIDE_TRADE", "OUTSIDE_AH", "OUTSIDE_VENDOR",
+                 "OUTSIDE_GUILD_BANK", "OUTSIDE_BANK", "OUTSIDE_REALM_BANK",
+                 "OUTSIDE_INTERACTION" };
+    }
+
+    // Facet flags a given condition type checks (empty = not an outside type).
+    // The per-service types are aliases over the same persistent flags the
+    // aggregate uses, so declaring one of them must not fail closed.
+    std::vector<char const*> OutsideFacetsForType(std::string const& type)
+    {
+        if (type == "CHALLENGE_CONDITIONS_TYPE_OUTSIDE_INTERACTION")
+            return AllOutsideFacets();
+        if (type == "CHALLENGE_CONDITIONS_TYPE_TAKE_MAIL_MONEY_OR_ITEM")
+            return { "OUTSIDE_MAIL" };
+        if (type == "CHALLENGE_CONDITIONS_TYPE_AUCTIONHOUSE_INTERACTION")
+            return { "OUTSIDE_AH" };
+        if (type == "CHALLENGE_CONDITIONS_TYPE_ACCEPT_TRADE")
+            return { "OUTSIDE_TRADE" };
+        if (type == "CHALLENGE_CONDITIONS_TYPE_VENDOR_INTERACTION")
+            return { "OUTSIDE_VENDOR" };
+        if (type == "CHALLENGE_CONDITIONS_TYPE_WITHDRAW_GUILD_BANK_MONEY_OR_ITEM")
+            return { "OUTSIDE_GUILD_BANK" };
+        if (type == "CHALLENGE_CONDITIONS_TYPE_WITHDRAW_BANK_MONEY_OR_ITEM")
+            return { "OUTSIDE_BANK" };
+        if (type == "CHALLENGE_CONDITIONS_TYPE_WITHDRAW_REALM_BANK_MONEY_OR_ITEM")
+            return { "OUTSIDE_REALM_BANK" };
+        return {};
+    }
+
+    // Broken when any of `allowed` facet flags is present; `message` names
+    // exactly what the character did before the trial.
+    bool OutsideInteractionBroken(std::set<std::string> const& flags,
+        std::vector<char const*> const& allowed, std::string& message)
+    {
+        std::string list;
+        for (char const* f : allowed)
+        {
+            if (!flags.count(f))
+                continue;
+            char const* label = OutsideFacetLabel(f);
+            if (!label)
+                continue;
+            if (!list.empty())
+                list += ", ";
+            list += label;
+        }
+        if (list.empty())
+            return false;
+        message = "You have already " + list + " before starting this trial.";
+        return true;
     }
 
     uint32 FreeInventorySlots(Player* player)
@@ -814,16 +1142,33 @@ namespace CoAChallenges
         return free;
     }
 
-    std::vector<ConditionState> EvaluateConditions(Player* player, uint32 challengeID)
+    // Number of primary professions the character has. Secondary skills
+    // (Cooking/Fishing/First Aid/Riding) are not counted.
+    uint32 PrimaryProfessionCount(Player* player)
+    {
+        static uint32 const kPrimaryProfessions[] = {
+            SKILL_ALCHEMY, SKILL_BLACKSMITHING, SKILL_ENCHANTING, SKILL_ENGINEERING,
+            SKILL_HERBALISM, SKILL_INSCRIPTION, SKILL_JEWELCRAFTING, SKILL_LEATHERWORKING,
+            SKILL_MINING, SKILL_SKINNING, SKILL_TAILORING,
+        };
+        uint32 count = 0;
+        for (uint32 skill : kPrimaryProfessions)
+            if (player->HasSkill(skill))
+                ++count;
+        return count;
+    }
+
+    // `conds` is normally the challenge's own condition list; the test harness
+    // passes a synthetic string with injectOutside=false to exercise one type
+    // without depending on a definition that declares it.
+    std::vector<ConditionState> EvaluateConditionsFor(Player* player, uint32 challengeID,
+        std::string const& conds, bool injectOutside)
     {
         std::vector<ConditionState> out;
-        std::string conds = ChallengeConditions(challengeID);
-        if (conds.empty())
-            return out;
-
         uint32 guid = player->GetGUID().GetCounter();
+        bool hasOutside = false;
         size_t start = 0;
-        while (start <= conds.size())
+        while (!conds.empty() && start <= conds.size())
         {
             size_t end = conds.find(';', start);
             if (end == std::string::npos)
@@ -853,11 +1198,15 @@ namespace CoAChallenges
                     s.detail = s.broken
                         ? "requires solo, current group of " + std::to_string(g)
                         : "solo";
+                    s.message = "This trial must be started solo (you are in a group of "
+                        + std::to_string(g) + ").";
                 }
                 else
                 {
                     s.broken = (g != v1);
                     s.detail = "requires " + std::to_string(v1) + ", current " + std::to_string(g);
+                    s.message = "This trial requires a group of " + std::to_string(v1)
+                        + " (you have " + std::to_string(g) + ").";
                 }
             }
             else if (type == "CHALLENGE_CONDITIONS_TYPE_HAVE_FREE_INVENTORY_SLOTS")
@@ -866,13 +1215,35 @@ namespace CoAChallenges
                 s.label = "HAVE_FREE_INVENTORY_SLOTS";
                 s.broken = (f < v1);
                 s.detail = "requires " + std::to_string(v1) + ", current " + std::to_string(f);
+                s.message = "You need at least " + std::to_string(v1)
+                    + " free inventory slots (you have " + std::to_string(f) + ").";
+            }
+            else if (type == "CHALLENGE_CONDITIONS_TYPE_HAVE_TWO_PRIMARY_PROFESSIONS")
+            {
+                // Normal form is "Cannot Have Two Primary Professions": broken
+                // when the character already has two or more.
+                uint32 const n = PrimaryProfessionCount(player);
+                s.label = "HAVE_TWO_PRIMARY_PROFESSIONS";
+                s.broken = (n >= 2);
+                s.detail = "primary professions: " + std::to_string(n);
+                s.message = "You cannot have two primary professions (you have "
+                    + std::to_string(n) + ").";
             }
             else if (type == "CHALLENGE_CONDITIONS_TYPE_LOOT_INTERACTION")
             {
-                bool looted = HasConditionFlag(guid, "LOOTED");
+                // Loot history gates a one-shot run, not a difficulty ladder. A
+                // multi-level challenge is entered at whichever level the player picks
+                // (Adventure Mode 1-100), and the mode itself is built on dungeon loot,
+                // so a lifetime "has looted" flag would lock out every level of it for a
+                // player who has ever opened a corpse. The condition stays live for
+                // single-level challenges, where "start clean" is the point of it.
+                bool const ladder = ChallengeLevelCount(challengeID) > 1;
+                bool looted = !ladder && HasConditionFlag(guid, "LOOTED");
                 s.label = "LOOT_INTERACTION";
                 s.broken = looted;
-                s.detail = looted ? "LOOTED" : "clean";
+                s.detail = ladder ? "not required for a multi-level challenge"
+                                  : (looted ? "LOOTED" : "clean");
+                s.message = "You have already looted something; this trial must be started before any loot interaction.";
             }
             else if (type == "CHALLENGE_CONDITIONS_TYPE_LEVEL_UP")
             {
@@ -882,6 +1253,7 @@ namespace CoAChallenges
                 s.label = "LEVEL_UP";
                 s.broken = leveled;
                 s.detail = "requires level 1, current " + std::to_string(player->GetLevel());
+                s.message = "You have already gained experience; this trial must be started at level 1.";
             }
             else if (type == "CHALLENGE_CONDITIONS_TYPE_CANNOT_HAVE_GAINED_EXPERIENCE")
             {
@@ -890,6 +1262,22 @@ namespace CoAChallenges
                 s.label = "CANNOT_HAVE_GAINED_EXPERIENCE";
                 s.broken = leveled;
                 s.detail = "requires level 1, current " + std::to_string(player->GetLevel());
+                s.message = "You have already gained experience; this trial must be started at level 1.";
+            }
+            else if (auto facets = OutsideFacetsForType(type); !facets.empty())
+            {
+                // OUTSIDE_INTERACTION and its per-service aliases (mail, trade,
+                // auction house, vendor, guild bank) share the same persistent
+                // facet flags; declaring one of them must not fail closed.
+                std::string message;
+                bool const outside = OutsideInteractionBroken(ConditionFlags(guid), facets, message);
+                s.label = type.substr(std::string("CHALLENGE_CONDITIONS_TYPE_").size());
+                s.broken = outside;
+                s.detail = outside ? "INTERACTED" : "clean";
+                if (outside)
+                    s.message = message;
+                if (type == "CHALLENGE_CONDITIONS_TYPE_OUTSIDE_INTERACTION")
+                    hasOutside = true;
             }
             else
             {
@@ -898,6 +1286,7 @@ namespace CoAChallenges
                 s.label = type;
                 s.broken = true;
                 s.detail = "unhandled condition type";
+                s.message = "This trial has an unsupported activation requirement and cannot be started.";
                 LOG_WARN("module.coa_challenges",
                     "Unhandled activation condition type '{}' (challenge {}) -> blocked",
                     type, challengeID);
@@ -908,7 +1297,30 @@ namespace CoAChallenges
                 break;
             start = end + 1;
         }
+
+        // OUTSIDE_INTERACTION is the one always-implicit gate (#4205 family):
+        // the client surfaces it via a dedicated activation reason code and no
+        // trial declares it per-trial, so inject it for every non-prestige
+        // trial. The other interaction types are facets of this single flag.
+        if (injectOutside && !hasOutside && OutsideInteractionGateEnabled()
+            && IsTrialChallenge(challengeID) && !IsPrestigeChallenge(challengeID))
+        {
+            std::string message;
+            bool const outside = OutsideInteractionBroken(ConditionFlags(guid), AllOutsideFacets(), message);
+            ConditionState s;
+            s.label = "OUTSIDE_INTERACTION";
+            s.broken = outside;
+            s.detail = outside ? "INTERACTED" : "clean";
+            if (outside)
+                s.message = message;
+            out.push_back(s);
+        }
         return out;
+    }
+
+    std::vector<ConditionState> EvaluateConditions(Player* player, uint32 challengeID)
+    {
+        return EvaluateConditionsFor(player, challengeID, ChallengeConditions(challengeID), true);
     }
 
     // Empty return = OK; otherwise a human-readable reason.
@@ -916,7 +1328,7 @@ namespace CoAChallenges
     {
         for (ConditionState const& s : EvaluateConditions(player, challengeID))
             if (s.broken)
-                return s.label + " (" + s.detail + ")";
+                return s.message.empty() ? (s.label + " (" + s.detail + ")") : s.message;
         return "";
     }
 
@@ -1056,6 +1468,16 @@ namespace CoAChallenges
         return 0;
     }
 
+    // A quest with no objectives: nothing to kill, collect, explore, pay or
+    // earn reputation for (talk-to and delivery quests).
+    bool IsQuestWithoutObjectives(Quest const* quest)
+    {
+        return !quest->GetReqItemsCount() && !quest->GetReqCreatureOrGOcount() && !quest->GetPlayersSlain()
+            && !quest->HasSpecialFlag(QUEST_SPECIAL_FLAGS_EXPLORATION_OR_EVENT)
+            && !quest->GetRepObjectiveFaction() && !quest->GetRepObjectiveFaction2()
+            && quest->GetRewOrReqMoney() >= 0;
+    }
+
     // NO_LEVEL_PAST_REQUIREMENTS: the lowest level ABOVE the player's current
     // one that still has an unmet tracked objective in an active challenge
     // carrying the rule, or 0 if none. XP must be capped one point short of it,
@@ -1075,12 +1497,13 @@ namespace CoAChallenges
             {
                 if (!IsTrackedObjective(o.type))
                     continue;
-                if (!o.v2 || o.v2 <= curLevel)
+                uint32 const objectiveGate = CoAParse::ObjectiveGateLevel(o);
+                if (!objectiveGate || objectiveGate <= curLevel)
                     continue;
                 if (IsObjectiveDone(guid, cid, o.key))
                     continue;
-                if (!gate || o.v2 < gate)
-                    gate = o.v2;
+                if (!gate || objectiveGate < gate)
+                    gate = objectiveGate;
             }
         }
         return gate;
@@ -1113,12 +1536,31 @@ namespace CoAChallenges
         // Rewards marked IsFirstCompletion are only given the first time this
         // level is completed (relevant only when re-completion is allowed).
         bool const firstCompletion = !HasCompletionLevel(guid, challengeID, level);
+        uint32 const account = player->GetSession()->GetAccountId();
+        bool const firstItemReward = firstCompletion && (!IsTrialChallenge(challengeID)
+            || !HasAccountCompletionLevel(account, challengeID, level));
 
-        CharacterDatabase.DirectExecute(
+        // Rewards are handed out while the challenge is still recorded as active, and the
+        // completion row that marks it done is written straight after. Granting last meant a
+        // failed grant (or a realm drop in between) consumed the challenge and paid nothing,
+        // with no way to retry; granting first at worst leaves the challenge complete with the
+        // reward already paid, which the row written below then records.
+        GrantChallengeRewards(player, challengeID, level, firstItemReward, firstCompletion);
+
+        CharacterDatabaseTransaction completion = CharacterDatabase.BeginTransaction();
+        completion->Append(
             "INSERT IGNORE INTO coa_challenge_completion (guid, challengeId, level, completeTime, startTime) "
             "VALUES ({}, {}, {}, UNIX_TIMESTAMP(), {})", guid, challengeID, level, startTime);
-        CharacterDatabase.DirectExecute(
+        auto* accountCompletion = CharacterDatabase.GetPreparedStatement(CHAR_INS_COA_ACCOUNT_CHALLENGE_COMPLETION);
+        accountCompletion->SetData(0, account);
+        accountCompletion->SetData(1, challengeID);
+        accountCompletion->SetData(2, level);
+        accountCompletion->SetData(3, startTime);
+        completion->Append(accountCompletion);
+        completion->Append(
             "DELETE FROM coa_character_challenge WHERE guid = {} AND challengeId = {}", guid, challengeID);
+        CharacterDatabase.DirectCommitTransaction(completion);
+        ForgetFailureSnapshot(guid, challengeID);
         ClearCharChallengeCache(guid);
         RemoveChallengeSpell(player, challengeID);
         RemoveMeterAuras(player);
@@ -1131,6 +1573,7 @@ namespace CoAChallenges
         UntrackInvertedBreath(player);
         RefreshRegenTracking(player);
         RefreshHighRiskTracking(player);
+        RefreshLevelScalingTracking(player);
         RefreshLootedTracking(player);
         RecomputeRequiredGameModes(player);
 
@@ -1139,8 +1582,6 @@ namespace CoAChallenges
         // "deactivate". Re-push the active list (now without this trial).
         SendActiveList(player);
         SendCriteriaState(player);
-
-        GrantChallengeRewards(player, challengeID, level, firstCompletion);
 
         if (WorldSession* session = player->GetSession())
         {
@@ -1191,9 +1632,10 @@ namespace CoAChallenges
             uint32 level = 0;
             for (Objective const& o : GetObjectives(cid))
             {
-                if (o.type != type || o.v1 != eventValue)
+                if (o.type != type || CoAParse::ObjectiveTarget(o) != eventValue)
                     continue;
-                if (o.v2 && player->GetLevel() >= o.v2)
+                uint32 const objectiveGate = CoAParse::ObjectiveGateLevel(o);
+                if (objectiveGate && player->GetLevel() >= objectiveGate)
                     continue;
                 if (!IsObjectiveDone(guid, cid, o.key))
                 {
@@ -1210,7 +1652,9 @@ namespace CoAChallenges
                     marked = true;
                 }
             }
-            if (marked && ObjectivesAllDone(guid, cid))
+            if (marked && ObjectivesAllDone(guid, cid)
+                && (!IsTrialChallenge(cid)
+                    || player->GetLevel() >= sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL)))
                 CompleteChallenge(player, cid);
         }
     }
@@ -1253,7 +1697,8 @@ namespace CoAChallenges
             {
                 if (!IsTrackedObjective(o.type))
                     continue;
-                if (!o.v2 || player->GetLevel() < o.v2)
+                uint32 const objectiveGate = CoAParse::ObjectiveGateLevel(o);
+                if (!objectiveGate || player->GetLevel() < objectiveGate)
                     continue;
                 if (IsObjectiveDone(guid, cid, o.key))
                     continue;
@@ -1281,7 +1726,9 @@ namespace CoAChallenges
                 return false;
             }
 
-            if (marked && ObjectivesAllDone(guid, cid))
+            if (marked && ObjectivesAllDone(guid, cid)
+                && (!IsTrialChallenge(cid)
+                    || player->GetLevel() >= sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL)))
                 CompleteChallenge(player, cid);
         }
         return true;
@@ -1303,10 +1750,12 @@ namespace CoAChallenges
             return;
         }
 
+        std::string eTrialId = trialID;
+        CharacterDatabase.EscapeString(eTrialId);
         std::vector<uint32> bundled;
         if (QueryResult r = CharacterDatabase.Query(
                 "SELECT challengeId FROM coa_custom_trial_entry WHERE guid = {} AND trialId = '{}'",
-                ownerGuid, trialID))
+                ownerGuid, eTrialId))
             do { bundled.push_back(r->Fetch()[0].Get<uint32>()); } while (r->NextRow());
 
         if (std::find(bundled.begin(), bundled.end(), challengeID) == bundled.end())
@@ -1328,13 +1777,14 @@ namespace CoAChallenges
     // killerSource: guid whose death carries the killer for the broadcast
     // (defaults to the failing player; shared fate passes the member who died).
     void FailChallenge(Player* player, uint32 challengeID, uint32 level, uint32 deaths,
-        ObjectGuid const& killerSource)
+        ObjectGuid const& killerSource, KillerKind causeKind, uint32 causeEntry, std::string causeName)
     {
         uint32 guid = player->GetGUID().GetCounter();
         // Capture the active custom-trial identity (if any) BEFORE any teardown,
         // so the failure announcement is attributed to the trial.
         std::string trialDisplayName, trialDisplayIcon;
         ActiveTrialDisplayFor(player, challengeID, trialDisplayName, trialDisplayIcon);
+        SaveFailureSnapshot(guid, challengeID, player->GetLevel());
         // INSERT IGNORE + synchronous: the PK (guid, challengeId) makes a repeat
         // fail a no-op, and a sync write means HasFailure/HasPermaDeathFailure
         // (read in the same tick) and the client re-push see the row immediately.
@@ -1358,6 +1808,7 @@ namespace CoAChallenges
         UntrackInvertedBreath(player);
         RefreshRegenTracking(player);
         RefreshHighRiskTracking(player);
+        RefreshLevelScalingTracking(player);
         RefreshLootedTracking(player);
         RecomputeRequiredGameModes(player);
 
@@ -1380,13 +1831,22 @@ namespace CoAChallenges
         // after OnPlayerKilledByCreature / OnPlayerPVPKill may have filled in
         // the killer).
         {
-            uint32 sourceGuid = (killerSource.IsEmpty() ? player->GetGUID() : killerSource).GetCounter();
             PendingFail pending;
             pending.challengeID = challengeID;
             pending.level = level;
             pending.displayName = trialDisplayName;
             pending.displayIcon = trialDisplayIcon;
+            if (causeKind != KillerKind::Unknown)
             {
+                // Rule failure (e.g. slaying a forbidden beast): name the cause
+                // directly; the player did not die, so there is no LastKiller.
+                pending.killerKind = causeKind;
+                pending.killerEntry = causeEntry;
+                pending.killerName = causeName;
+            }
+            else
+            {
+                uint32 sourceGuid = (killerSource.IsEmpty() ? player->GetGUID() : killerSource).GetCounter();
                 std::lock_guard<std::mutex> lock(LastKillerMutex);
                 auto it = LastKiller.find(sourceGuid);
                 if (it != LastKiller.end())
@@ -1399,6 +1859,48 @@ namespace CoAChallenges
             std::lock_guard<std::mutex> lock(PendingFailMutex);
             PendingFailBroadcast[guid] = pending;
         }
+    }
+
+    // Fail a character that is offline (a SharedFate partner): only the DB rows
+    // matter. Auras/meters/packets are moot for a character not in the world
+    // (login strips orphan challenge auras), but the failure lock and the active
+    // row must be written, or the partner would keep playing the trial.
+    void FailChallengeOffline(uint32 guid, uint32 challengeID, uint32 level, uint32 deaths,
+        ObjectGuid const& killerSource)
+    {
+        SaveFailureSnapshot(guid, challengeID,
+            sCharacterCache->GetCharacterLevelByGuid(ObjectGuid::Create<HighGuid::Player>(guid)));
+        CharacterDatabase.DirectExecute(
+            "INSERT IGNORE INTO coa_challenge_failure (guid, challengeId, level, deaths, failTime) "
+            "VALUES ({}, {}, {}, {}, UNIX_TIMESTAMP())",
+            guid, challengeID, level, deaths);
+        CharacterDatabase.DirectExecute(
+            "DELETE FROM coa_character_challenge WHERE guid = {} AND challengeId = {}",
+            guid, challengeID);
+        ClearCharChallengeCache(guid);
+        LOG_INFO("module.coa_challenges", "Challenge {} ({}) failed for offline character {} (deaths={})",
+            challengeID, ChallengeName(challengeID), guid, deaths);
+
+        // Queue the realm announcement too, so an offline SharedFate partner is
+        // announced like the online ones (the flush resolves name/level from the
+        // character cache).
+        PendingFail pending;
+        pending.challengeID = challengeID;
+        pending.level = level;
+        {
+            uint32 sourceGuid = (killerSource.IsEmpty()
+                ? ObjectGuid::Create<HighGuid::Player>(guid) : killerSource).GetCounter();
+            std::lock_guard<std::mutex> lock(LastKillerMutex);
+            auto it = LastKiller.find(sourceGuid);
+            if (it != LastKiller.end())
+            {
+                pending.killerKind = it->second.kind;
+                pending.killerEntry = it->second.entry;
+                pending.killerName = it->second.name;
+            }
+        }
+        std::lock_guard<std::mutex> lock(PendingFailMutex);
+        PendingFailBroadcast[guid] = pending;
     }
 
     // Shared fate (Duo/Trio/Vitality): one holder's death fails EVERY holder
@@ -1423,17 +1925,22 @@ namespace CoAChallenges
         for (Group::MemberSlotList::const_iterator itr = group->GetMemberSlots().begin();
              itr != group->GetMemberSlots().end(); ++itr)
         {
-            Player* member = ObjectAccessor::FindPlayer(itr->guid);
-            if (!member)
-                continue;
-            uint32 mguid = member->GetGUID().GetCounter();
+            uint32 mguid = itr->guid.GetCounter();
             QueryResult r = CharacterDatabase.Query(
                 "SELECT level, deaths FROM coa_character_challenge WHERE guid = {} AND challengeId = {}",
                 mguid, challengeID);
             if (!r)
                 continue;
             Field* f = r->Fetch();
-            uint32 deaths = f[1].Get<uint32>() + (member == dead ? 1 : 0);
+            uint32 deaths = f[1].Get<uint32>() + (itr->guid == dead->GetGUID() ? 1 : 0);
+            Player* member = ObjectAccessor::FindPlayer(itr->guid);
+            if (!member)
+            {
+                // Offline partner: fail it in the DB too, or it would keep the
+                // trial on relogin.
+                FailChallengeOffline(mguid, challengeID, f[0].Get<uint32>(), deaths, dead->GetGUID());
+                continue;
+            }
             if (member == dead)
                 CharacterDatabase.Execute(
                     "UPDATE coa_character_challenge SET deaths = {} WHERE guid = {} AND challengeId = {}",
@@ -1445,25 +1952,26 @@ namespace CoAChallenges
     // Leaving/disbanding a group fails SharedFate (Duo/Trio) challenges: the
     // leaver fails, and by shared fate so do the remaining holders. `extra` is
     // the member already removed from `group` (nullptr for a disband).
-    void FailSharedFateHolders(Group* group, Player* extra)
+    void FailSharedFateHolders(Group* group, ObjectGuid extraGuid)
     {
         if (!ChallengesEnabled())
             return;
 
-        std::vector<std::pair<Player*, uint32>> targets;
-        auto collect = [&targets](Player* member)
+        // Keyed by guid (not Player*) so offline partners are failed too.
+        std::vector<std::pair<ObjectGuid, uint32>> targets;
+        auto collect = [&targets](ObjectGuid guid)
         {
-            if (!member)
+            if (guid.IsEmpty())
                 return;
             if (QueryResult r = CharacterDatabase.Query(
                     "SELECT challengeId FROM coa_character_challenge WHERE guid = {}",
-                    member->GetGUID().GetCounter()))
+                    guid.GetCounter()))
             {
                 do
                 {
                     uint32 cid = r->Fetch()[0].Get<uint32>();
                     if (IsSharedFate(cid))
-                        targets.emplace_back(member, cid);
+                        targets.emplace_back(guid, cid);
                 } while (r->NextRow());
             }
         };
@@ -1471,17 +1979,22 @@ namespace CoAChallenges
         if (group)
             for (Group::MemberSlotList::const_iterator itr = group->GetMemberSlots().begin();
                  itr != group->GetMemberSlots().end(); ++itr)
-                collect(ObjectAccessor::FindPlayer(itr->guid));
-        collect(extra);
+                collect(itr->guid);
+        if (!extraGuid.IsEmpty())
+            collect(extraGuid);
 
-        for (auto const& [member, cid] : targets)
+        for (auto const& [guid, cid] : targets)
         {
             if (QueryResult r = CharacterDatabase.Query(
                     "SELECT level, deaths FROM coa_character_challenge WHERE guid = {} AND challengeId = {}",
-                    member->GetGUID().GetCounter(), cid))
+                    guid.GetCounter(), cid))
             {
                 Field* f = r->Fetch();
-                FailChallenge(member, cid, f[0].Get<uint32>(), f[1].Get<uint32>());
+                if (Player* member = ObjectAccessor::FindPlayer(guid))
+                    FailChallenge(member, cid, f[0].Get<uint32>(), f[1].Get<uint32>());
+                else
+                    FailChallengeOffline(guid.GetCounter(), cid, f[0].Get<uint32>(), f[1].Get<uint32>(),
+                        ObjectGuid::Empty);
             }
         }
     }
@@ -1490,7 +2003,7 @@ namespace CoAChallenges
     // (group == nullptr still fails the leaver's SharedFate challenge).
     void Test_FailSharedFateOnLeave(Player* player)
     {
-        FailSharedFateHolders(nullptr, player);
+        FailSharedFateHolders(nullptr, player->GetGUID());
     }
 
     void HandlePlayerDeath(Player* player)
@@ -1571,5 +2084,303 @@ namespace CoAChallenges
                     "Your {} challenge has failed.", GameModeNameForBit(bit));
             }
         }
+    }
+
+    // ---- GM tooling: objective listing/credit and failed-run restore -------
+    // (`.coa trial objectives|credit|restore`, see CoA.Challenges.Scripts.cpp)
+
+    // Tracked objectives in definition order. The 1-based position in this
+    // list is the objective number the GM commands show and accept.
+    std::vector<Objective> TrackedObjectives(uint32 challengeID)
+    {
+        std::vector<Objective> tracked;
+        for (Objective const& o : GetObjectives(challengeID))
+            if (IsTrackedObjective(o.type))
+                tracked.push_back(o);
+        return tracked;
+    }
+
+    std::string DescribeObjective(Objective const& o)
+    {
+        uint32 const target = CoAParse::ObjectiveTarget(o);
+        uint32 const gate = CoAParse::ObjectiveGateLevel(o);
+        std::string text;
+        if (o.type == "CHALLENGE_REQUIREMENT_TYPE_KILL_CREATURE_BEFORE_LEVEL")
+        {
+            CreatureTemplate const* creature = sObjectMgr->GetCreatureTemplate(target);
+            text = creature ? Acore::StringFormat("Kill {}", creature->Name)
+                : Acore::StringFormat("Kill creature {}", target);
+        }
+        else if (o.type == "CHALLENGE_REQUIREMENT_TYPE_LOOT_ITEM_BEFORE_LEVEL")
+        {
+            ItemTemplate const* item = sObjectMgr->GetItemTemplate(target);
+            text = item ? Acore::StringFormat("Loot {}", item->Name1)
+                : Acore::StringFormat("Loot item {}", target);
+        }
+        else if (o.type == "CHALLENGE_REQUIREMENT_TYPE_COMPLETE_QUEST_BEFORE_LEVEL")
+        {
+            Quest const* quest = sObjectMgr->GetQuestTemplate(target);
+            text = quest ? Acore::StringFormat("Complete quest \"{}\"", quest->GetTitle())
+                : Acore::StringFormat("Complete quest {}", target);
+        }
+        else if (o.type == "CHALLENGE_REQUIREMENT_TYPE_EARN_MONEY_BEFORE_LEVEL")
+            text = Acore::StringFormat("Carry {}g {}s {}c", target / 10000, (target / 100) % 100, target % 100);
+        else if (o.type == "CHALLENGE_REQUIREMENT_TYPE_DUO")
+            text = "Start in a party of two";
+        else if (o.type == "CHALLENGE_REQUIREMENT_TYPE_TRIO")
+            text = "Start in a party of three";
+        else
+            text = o.key;
+        if (gate)
+            text += Acore::StringFormat(" before level {}", gate);
+        return text;
+    }
+
+    // GM credit for one objective. Unlike MarkObjectives it ignores the
+    // objective's level gate; the banner and the completion check are the same.
+    bool CreditObjective(Player* player, uint32 challengeID, uint32 number, std::string& message)
+    {
+        uint32 const guid = player->GetGUID().GetCounter();
+        if (!ActiveChallenges(guid).count(challengeID))
+        {
+            message = Acore::StringFormat("Challenge {} is not active for {}.", challengeID, player->GetName());
+            return false;
+        }
+        std::vector<Objective> const tracked = TrackedObjectives(challengeID);
+        if (!number || number > tracked.size())
+        {
+            message = Acore::StringFormat(
+                "Challenge {} has no Objective ID {} (it has {}); see .coa trial objectives.",
+                challengeID, number, tracked.size());
+            return false;
+        }
+        Objective const& o = tracked[number - 1];
+        if (IsObjectiveDone(guid, challengeID, o.key))
+        {
+            message = Acore::StringFormat("Objective {} ({}) is already done for {}.",
+                number, DescribeObjective(o), player->GetName());
+            return false;
+        }
+
+        SetObjectiveDone(guid, challengeID, o.key);
+        LOG_INFO("module.coa_challenges", "{} was credited objective {} (challenge {}) by a GM",
+            player->GetName(), o.key, challengeID);
+        SendCriteriaUpdatedForObjective(player, challengeID, ActiveChallengeLevel(guid, challengeID), o, true);
+
+        uint32 const gate = CoAParse::ObjectiveGateLevel(o);
+        message = Acore::StringFormat("Credited objective {} ({}) on challenge {} for {}",
+            number, DescribeObjective(o), challengeID, player->GetName());
+        if (gate && player->GetLevel() >= gate)
+            message += Acore::StringFormat(" (past its level {} gate)", gate);
+        message += ".";
+
+        if (ObjectivesAllDone(guid, challengeID))
+        {
+            uint32 const cap = sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL);
+            if (!IsTrialChallenge(challengeID) || player->GetLevel() >= cap)
+            {
+                CompleteChallenge(player, challengeID);
+                message += " All objectives done: challenge completed.";
+            }
+            else
+                message += Acore::StringFormat(" All objectives done; completes at level {}.", cap);
+        }
+        return true;
+    }
+
+    // Called at the top of a failure, while the active row still exists: keeps
+    // what the failure is about to discard (the run timer) for
+    // `.coa trial restore`, with the character's level so a restore can tell
+    // which objective gates the character has passed since.
+    // The statement copies the active row, so a repeat failure call, which
+    // finds none, writes nothing and leaves the snapshot alone.
+    void SaveFailureSnapshot(uint32 guid, uint32 challengeID, uint32 characterLevel)
+    {
+        auto* snapshot = CharacterDatabase.GetPreparedStatement(CHAR_REP_COA_CHALLENGE_FAILURE_SNAPSHOT);
+        snapshot->SetData(0, characterLevel);
+        snapshot->SetData(1, guid);
+        snapshot->SetData(2, challengeID);
+        CharacterDatabase.DirectExecute(snapshot);
+    }
+
+    // Synchronous, so a failure right after an activation cannot have its
+    // fresh snapshot removed by a delete still waiting in the async queue.
+    void ForgetFailureSnapshot(uint32 guid, uint32 challengeID)
+    {
+        auto* forget = CharacterDatabase.GetPreparedStatement(CHAR_DEL_COA_CHALLENGE_FAILURE_SNAPSHOT);
+        forget->SetData(0, guid);
+        forget->SetData(1, challengeID);
+        CharacterDatabase.DirectExecute(forget);
+    }
+
+    // GM restore of a failed run: drops the failure lock and puts the challenge
+    // back as active from the snapshot taken at the failure (or, for a failure
+    // older than the snapshot table, from the failure record alone). A custom
+    // trial the challenge belonged to is not restored.
+    bool RestoreFailedChallenge(Player* player, uint32 challengeID, std::string& message)
+    {
+        uint32 const guid = player->GetGUID().GetCounter();
+        auto* selectFailure = CharacterDatabase.GetPreparedStatement(CHAR_SEL_COA_CHALLENGE_FAILURE);
+        selectFailure->SetData(0, guid);
+        selectFailure->SetData(1, challengeID);
+        PreparedQueryResult failure = CharacterDatabase.Query(selectFailure);
+        if (!failure)
+        {
+            message = Acore::StringFormat("{} has no failure lock on challenge {}.", player->GetName(), challengeID);
+            return false;
+        }
+        if (ActiveChallenges(guid).count(challengeID))
+        {
+            message = Acore::StringFormat("Challenge {} is already active for {}.", challengeID, player->GetName());
+            return false;
+        }
+
+        uint32 level = failure->Fetch()[0].Get<uint32>();
+        uint32 deaths = failure->Fetch()[1].Get<uint32>();
+        uint32 startTime = uint32(::time(nullptr));
+        uint32 levelAtFailure = 0;
+        auto* selectSnapshot = CharacterDatabase.GetPreparedStatement(CHAR_SEL_COA_CHALLENGE_FAILURE_SNAPSHOT);
+        selectSnapshot->SetData(0, guid);
+        selectSnapshot->SetData(1, challengeID);
+        PreparedQueryResult snapshot = CharacterDatabase.Query(selectSnapshot);
+        bool const fromSnapshot = snapshot != nullptr;
+        if (fromSnapshot)
+        {
+            Field* f = snapshot->Fetch();
+            level = f[0].Get<uint32>();
+            deaths = f[1].Get<uint32>();
+            startTime = f[2].Get<uint32>();
+            levelAtFailure = f[3].Get<uint32>();
+        }
+
+        uint32 conflictId = 0;
+        if (ConflictingExclusiveChallenge(guid, challengeID, conflictId))
+        {
+            message = Acore::StringFormat(
+                "Cannot restore challenge {} for {}: it conflicts with active challenge {}.",
+                challengeID, player->GetName(), conflictId);
+            return false;
+        }
+
+        // Levels gained after the failure were earned without the challenge's
+        // rules (lives, bans on the auction house, mail and trade, level cap). A
+        // few are tolerated for a player who kept playing while waiting for a
+        // GM; more than the allowance refuses. A challenge without objective
+        // gates has no other check, so its failure needs the recorded level.
+        std::vector<Objective> const tracked = TrackedObjectives(challengeID);
+        uint32 const currentLevel = player->GetLevel();
+        uint32 const levelAllowance = sConfigMgr->GetOption<uint32>("CoAChallenges.Restore.MaxLevelsGained", 3);
+        if (levelAtFailure && currentLevel > levelAtFailure + levelAllowance)
+        {
+            message = Acore::StringFormat(
+                "Restore refused: {} was level {} when challenge {} failed and is now level {}, more than the {} "
+                "levels allowed since a failure (CoAChallenges.Restore.MaxLevelsGained).",
+                player->GetName(), levelAtFailure, challengeID, currentLevel, levelAllowance);
+            return false;
+        }
+        if (!levelAtFailure && std::none_of(tracked.begin(), tracked.end(),
+                [](Objective const& o) { return CoAParse::ObjectiveGateLevel(o) != 0; }))
+        {
+            message = Acore::StringFormat(
+                "Restore refused: challenge {} failed for {} before failures recorded the character's level, "
+                "and it has no objective gates to check the levels gained since against.",
+                challengeID, player->GetName());
+            return false;
+        }
+
+        // Within the allowance a character may still only be restored while
+        // every pending objective is within reach. An objective only counts
+        // below its gate level, so once the character has levelled past a
+        // pending gate the run can no longer be finished by playing. Without a
+        // snapshot the level at the failure is unknown (0), so any pending gate
+        // at or below the current level refuses.
+        for (std::size_t i = 0; i < tracked.size(); ++i)
+        {
+            uint32 const gate = CoAParse::ObjectiveGateLevel(tracked[i]);
+            if (!gate || gate <= levelAtFailure || gate > currentLevel
+                || IsObjectiveDone(guid, challengeID, tracked[i].key))
+                continue;
+            message = Acore::StringFormat(
+                "Restore refused: {} is level {}, past the level {} gate of pending objective {} ({}) on "
+                "challenge {}. That objective can no longer be earned.",
+                player->GetName(), currentLevel, gate, i + 1, DescribeObjective(tracked[i]), challengeID);
+            return false;
+        }
+
+        // The fatal death is taken back so the run is not left at zero lives.
+        uint32 const lives = LivesTotal(challengeID);
+        if (lives && deaths >= lives)
+            deaths = lives - 1;
+
+        // One transaction: the lock, the active row, the meters and the
+        // snapshot change together or not at all.
+        CharacterDatabaseTransaction restore = CharacterDatabase.BeginTransaction();
+        auto* deleteFailure = CharacterDatabase.GetPreparedStatement(CHAR_DEL_COA_CHALLENGE_FAILURE);
+        deleteFailure->SetData(0, guid);
+        deleteFailure->SetData(1, challengeID);
+        restore->Append(deleteFailure);
+        auto* activate = CharacterDatabase.GetPreparedStatement(CHAR_REP_COA_CHARACTER_CHALLENGE);
+        activate->SetData(0, guid);
+        activate->SetData(1, challengeID);
+        activate->SetData(2, level);
+        activate->SetData(3, deaths);
+        activate->SetData(4, startTime);
+        restore->Append(activate);
+        // The meters restart fresh, as on activation: a run that failed on a
+        // full hunger or thirst meter or an empty fatigue bar would otherwise
+        // die again at once. No fatigue row means a full bar.
+        auto* deleteFatigue = CharacterDatabase.GetPreparedStatement(CHAR_DEL_COA_CHARACTER_FATIGUE);
+        deleteFatigue->SetData(0, guid);
+        deleteFatigue->SetData(1, challengeID);
+        restore->Append(deleteFatigue);
+        bool const hungerReset = IsHungerChallenge(challengeID);
+        bool const fatigueReset = IsFatigueChallenge(challengeID);
+        if (hungerReset)
+        {
+            auto* resetSurvival = CharacterDatabase.GetPreparedStatement(CHAR_UPD_COA_CHARACTER_SURVIVAL_RESET);
+            resetSurvival->SetData(0, guid);
+            restore->Append(resetSurvival);
+        }
+        auto* deleteSnapshot = CharacterDatabase.GetPreparedStatement(CHAR_DEL_COA_CHALLENGE_FAILURE_SNAPSHOT);
+        deleteSnapshot->SetData(0, guid);
+        deleteSnapshot->SetData(1, challengeID);
+        restore->Append(deleteSnapshot);
+        CharacterDatabase.DirectCommitTransaction(restore);
+        ClearCharChallengeCache(guid);
+
+        bool const resurrected = !player->IsAlive();
+        if (resurrected)
+        {
+            player->ResurrectPlayer(1.0f);
+            player->SpawnCorpseBones();
+        }
+
+        // The login push rebuilds every tracker, aura and client list from the
+        // row just written; it is idempotent for an in-world character.
+        PreloadLoginChallengeRows(guid);
+        PushLoginState(player);
+
+        uint32 done = 0;
+        for (Objective const& o : tracked)
+            if (IsObjectiveDone(guid, challengeID, o.key))
+                ++done;
+        LOG_INFO("module.coa_challenges", "Challenge {} ({}) restored for {} by a GM (level {}, deaths {}, {})",
+            challengeID, ChallengeName(challengeID), player->GetName(), level, deaths,
+            fromSnapshot ? "from snapshot" : "no snapshot");
+        message = Acore::StringFormat(
+            "Restored challenge {} ({}) for {}: level {}, deaths {}, {} of {} objectives done.",
+            challengeID, ChallengeName(challengeID), player->GetName(), level, deaths, done, tracked.size());
+        if (resurrected)
+            message += " Resurrected.";
+        if (levelAtFailure && currentLevel > levelAtFailure)
+            message += Acore::StringFormat(" The character was level {} at the failure and is now level {}.",
+                levelAtFailure, currentLevel);
+        if (hungerReset)
+            message += " Hunger and thirst start from zero.";
+        if (fatigueReset)
+            message += " The fatigue bar is full.";
+        if (!fromSnapshot)
+            message += " No snapshot existed for this failure: the run timer restarted.";
+        return true;
     }
 } // namespace CoAChallenges

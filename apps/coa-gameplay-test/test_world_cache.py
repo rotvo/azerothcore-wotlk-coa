@@ -1,15 +1,17 @@
-"""Cache ownership, invalidation and startup-barrier behavior without a MySQL service."""
-
 import copy
 import json
 from pathlib import Path
 import re
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from world_cache import WorldCache, input_fingerprint, world_fingerprint
+import run
+from world_cache import WorldCache, input_fingerprint, run_parallel, world_fingerprint
+
+SERVER_UUID = '11111111-2222-3333-4444-555555555555'
 
 
 class DatabaseFixture:
@@ -20,10 +22,11 @@ class DatabaseFixture:
         self.schemas = {'source_world': {'data': 'original data', 'token': None}}
         self.copies = 0
         self.dropped = []
+        self.drop_timeouts = []
 
     def sql(self, role, statement, timeout=60):
         if statement == 'SELECT @@server_uuid;':
-            return 'test-server'
+            return SERVER_UUID
         name = re.search(r'`([^`]+)`', statement)[1]
         if statement.startswith('CREATE DATABASE'):
             if name in self.schemas:
@@ -31,6 +34,7 @@ class DatabaseFixture:
             self.schemas[name] = {'data': '', 'token': None}
         elif statement.startswith('DROP DATABASE'):
             self.dropped.append(name)
+            self.drop_timeouts.append(timeout)
             del self.schemas[name]
         elif statement.startswith('CREATE TABLE'):
             self.schemas[name]['token'] = re.search(r"VALUES \('([0-9a-f]+)'\)", statement)[1]
@@ -39,6 +43,8 @@ class DatabaseFixture:
         else:
             raise AssertionError(statement)
         return ''
+
+    drop = run.Databases.drop
 
     def copy(self, role):
         self.copies += 1
@@ -88,6 +94,13 @@ class WorldCacheTests(unittest.TestCase):
         self.assertEqual(self.database.dropped, [first.name])
         self.assertEqual(second.info['mode'], 'refreshed')
         self.assertEqual(self.database.schemas[second.name]['data'], 'new spell data')
+
+    def test_drop_uses_long_timeout(self):
+        first = self.cache()
+        self.run_clean(first)
+        self.database.schemas['source_world']['data'] = 'new spell data'
+        self.run_clean(self.cache())
+        self.assertEqual(self.database.drop_timeouts, [run.DROP_TIMEOUT])
 
     def test_sql_or_configuration_change_refreshes_copy(self):
         first = self.cache()
@@ -157,6 +170,39 @@ class WorldCacheTests(unittest.TestCase):
         second.finish()
         self.assertEqual(self.database.dropped, [])
 
+    def test_empty_server_identity_is_retried_without_creating_a_different_cache(self):
+        first = self.cache()
+        with patch.object(self.database, 'sql', side_effect=['', SERVER_UUID]) as query:
+            second = self.cache()
+        self.assertEqual(first.identity, second.identity)
+        self.assertEqual(query.call_count, 2)
+
+    def test_missing_server_identity_never_acquires_a_cache(self):
+        with patch.object(self.database, 'sql', return_value='') as query:
+            with self.assertRaisesRegex(ValueError, 'no data after three reads'):
+                self.cache()
+        self.assertEqual(query.call_count, 3)
+        self.assertEqual(self.database.copies, 0)
+        self.assertEqual(self.database.dropped, [])
+
+    def test_truncated_server_identity_is_not_a_new_cache_key(self):
+        with patch.object(self.database, 'sql', return_value=SERVER_UUID[:8]):
+            with self.assertRaisesRegex(ValueError, 'not a complete MySQL UUID'):
+                self.cache()
+        self.assertEqual(self.database.copies, 0)
+
+    def test_empty_ownership_read_retries_but_a_real_mismatch_still_fails(self):
+        first = self.cache()
+        self.run_clean(first)
+        with patch.object(self.database, 'sql', side_effect=['', first.metadata['token']]) as query:
+            first.verify_owner()
+        self.assertEqual(query.call_count, 2)
+        with patch.object(self.database, 'sql', side_effect=['', 'somebody else']) as query:
+            with self.assertRaisesRegex(ValueError, 'ownership mismatch'):
+                first.verify_owner()
+        self.assertEqual(query.call_count, 2)
+        self.assertEqual(self.database.dropped, [])
+
     def test_concurrent_run_does_not_remove_other_lease(self):
         first = self.cache()
         first.prepare()
@@ -182,7 +228,6 @@ class WorldCacheTests(unittest.TestCase):
         self.assertTrue(first.lock.exists())
         with self.assertRaisesRegex(ValueError, 'leased'):
             self.cache().prepare(refresh=True)
-        # The fixture's simulated child has stopped; normal cleanup can now run.
         first.finish()
 
     def test_copy_rejects_concurrent_source_changes(self):
@@ -282,6 +327,116 @@ class FingerprintTests(unittest.TestCase):
         with patch.object(database, 'sql', side_effect=responses):
             with self.assertRaisesRegex(ValueError, 'excludes triggers/routines/events'):
                 world_fingerprint(database, 'world')
+
+    def test_incomplete_definitions_are_retried_but_never_used_as_a_fingerprint(self):
+        database = SimpleNamespace(sql=None)
+        prefix = ['spells\tBASE TABLE', 'world.spells\t123']
+        definitions = 'spells\tCREATE TABLE spells (...)'
+        with patch.object(database, 'sql', side_effect=prefix + [definitions, '0']):
+            expected = world_fingerprint(database, 'world')
+        with patch.object(database, 'sql', side_effect=prefix + ['', definitions, '0']):
+            self.assertEqual(world_fingerprint(database, 'world'), expected)
+        with patch.object(database, 'sql', side_effect=prefix + ['', '', '']) as query:
+            with self.assertRaisesRegex(ValueError, 'Incomplete world table definitions'):
+                world_fingerprint(database, 'world')
+        self.assertEqual(query.call_count, 5)
+
+    def test_parallel_fingerprint_equals_serial(self):
+        tables = [f'table_{index:02d}' for index in range(11)]
+        lock = threading.Lock()
+        statements = []
+
+        def sql(role, statement, timeout=None):
+            with lock:
+                statements.append(statement)
+            if statement.startswith('SHOW FULL TABLES'):
+                return '\n'.join(f'{table}\tBASE TABLE' for table in tables)
+            if statement.startswith('CHECKSUM TABLE'):
+                names = re.findall(r'`world`\.`(\w+)`', statement)
+                return '\n'.join(f'world.{table}\t{1000 + int(table[-2:])}' for table in names)
+            if statement.startswith('SHOW CREATE TABLE'):
+                return '\n'.join(f'{table}\tCREATE TABLE {table} (...)' for table in tables)
+            return '0'
+
+        serial = world_fingerprint(SimpleNamespace(sql=sql, copy_workers=1), 'world')
+        serial_checksums = [item for item in statements if item.startswith('CHECKSUM')]
+        self.assertEqual(len(serial_checksums), 1)
+        statements.clear()
+        parallel = world_fingerprint(SimpleNamespace(sql=sql, copy_workers=4), 'world')
+        self.assertEqual(parallel, serial)
+        self.assertEqual(len([item for item in statements if item.startswith('CHECKSUM')]), 4)
+        statements.clear()
+        capped = world_fingerprint(SimpleNamespace(sql=sql, copy_workers=64), 'world')
+        self.assertEqual(capped, serial)
+        self.assertEqual(len([item for item in statements if item.startswith('CHECKSUM')]), 8)
+
+    def test_run_parallel_runs_inline_for_one_worker_or_one_item(self):
+        threads = []
+
+        def record(item):
+            threads.append(threading.get_ident())
+            return item * 2
+
+        self.assertEqual(run_parallel(record, [1, 2, 3], 1), [2, 4, 6])
+        self.assertEqual(run_parallel(record, [5], 4), [10])
+        self.assertEqual(set(threads), {threading.get_ident()})
+
+    def test_run_parallel_preserves_item_order(self):
+        barrier = threading.Barrier(3, timeout=10)
+
+        def slow_first(item):
+            if item < 3:
+                barrier.wait()
+            return item
+
+        self.assertEqual(run_parallel(slow_first, list(range(8)), 3), list(range(8)))
+
+    def test_run_parallel_reraises_first_failure_and_starts_nothing_after_it(self):
+        started = []
+
+        def fail(item):
+            started.append(item)
+            raise ValueError(f'failed {item}')
+
+        with self.assertRaisesRegex(ValueError, 'failed 0'):
+            run_parallel(fail, list(range(50)), 1)
+        self.assertEqual(started, [0])
+        started.clear()
+        with self.assertRaises(ValueError):
+            run_parallel(fail, list(range(50)), 2)
+        self.assertLessEqual(len(started), 2)
+
+    def test_run_parallel_stops_and_joins_started_threads_when_a_start_fails(self):
+        release = threading.Event()
+        started = []
+        original = threading.Thread.start
+        calls = []
+
+        def start(thread):
+            calls.append(thread)
+            if len(calls) == 2:
+                release.set()
+                raise RuntimeError("can't start new thread")
+            original(thread)
+
+        def work(item):
+            started.append(item)
+            release.wait(10)
+
+        with patch.object(threading.Thread, 'start', start):
+            with self.assertRaisesRegex(RuntimeError, "can't start"):
+                run_parallel(work, list(range(10)), 4)
+        self.assertEqual(len(started), 1)
+        self.assertFalse([item for item in threading.enumerate() if item is calls[0]])
+
+    def test_parallel_checksum_failure_is_raised(self):
+        def sql(role, statement, timeout=None):
+            if statement.startswith('SHOW FULL TABLES'):
+                return 'a\tBASE TABLE\nb\tBASE TABLE'
+            raise ValueError('checksum timed out')
+
+        with self.assertRaisesRegex(ValueError, 'checksum timed out'):
+            world_fingerprint(SimpleNamespace(sql=sql, copy_workers=2), 'world')
 
 
 if __name__ == '__main__':

@@ -16,7 +16,9 @@
  */
 
 #include "LootMgr.h"
+#include "AscensionEquippedGearLoot.h"
 #include "Containers.h"
+#include "Creature.h"
 #include "DisableMgr.h"
 #include "Group.h"
 #include "ItemEnchantmentMgr.h"
@@ -484,15 +486,31 @@ void Loot::AddItem(LootStoreItem const& item)
     if (!proto)
         return;
 
+    if (proto->Class == ITEM_CLASS_RECIPE && proto->SubClass == ITEM_SUBCLASS_JEWELCRAFTING_RECIPE)
+        if (Player* owner = ObjectAccessor::FindPlayer(lootOwnerGUID))
+            if (owner->GetSession()->Expansion() < EXPANSION_THE_BURNING_CRUSADE)
+                return;
+
     uint32 count = urand(item.mincount, item.maxcount);
     uint32 stacks = count / proto->GetMaxStackSize() + (count % proto->GetMaxStackSize() ? 1 : 0);
 
-    std::vector<LootItem>& lootItems = item.needs_quest ? quest_items : items;
-    uint32 limit = item.needs_quest ? MAX_NR_QUEST_ITEMS : MAX_NR_LOOT_ITEMS;
+    bool needsQuest = item.needs_quest;
+    if (sharedQuestLoot && !needsQuest)
+        if (Player* owner = ObjectAccessor::FindPlayer(lootOwnerGUID))
+            if (Creature* source = owner->GetMap()->GetCreature(sourceWorldObjectGUID))
+                needsQuest = source->IsSharedQuestItem(item.itemid);
+    std::vector<LootItem>& lootItems = needsQuest ? quest_items : items;
+    uint32 limit = needsQuest ? MAX_NR_QUEST_ITEMS : maxItemCount;
 
     for (uint32 i = 0; i < stacks && lootItems.size() < limit; ++i)
     {
         LootItem generatedLoot(item);
+        generatedLoot.needs_quest = needsQuest && !(sharedQuestLoot && proto->StartQuest);
+        if (sharedQuestLoot && needsQuest)
+        {
+            generatedLoot.freeforall = true;
+            generatedLoot.follow_loot_rules = false;
+        }
         generatedLoot.count = std::min(count, proto->GetMaxStackSize());
         generatedLoot.itemIndex = lootItems.size();
         lootItems.push_back(generatedLoot);
@@ -531,9 +549,37 @@ void Loot::AddItem(LootStoreItem const& item)
         // non-conditional one-player only items are counted here,
         // free for all items are counted in FillFFALoot(),
         // non-ffa conditionals are counted in FillNonQuestNonFFAConditionalLoot()
-        if (!item.needs_quest && item.conditions.empty() && !proto->HasFlag(ITEM_FLAG_MULTI_DROP))
+        if (!needsQuest && item.conditions.empty() && !proto->HasFlag(ITEM_FLAG_MULTI_DROP))
             ++unlootedCount;
     }
+}
+
+void LootTemplate::CollectItems(std::vector<LootStoreItem const*>& out, uint8 depth) const
+{
+    if (depth > 4)
+        return;
+
+    auto collect = [&](LootStoreItemList const& list)
+    {
+        for (LootStoreItem const* item : list)
+        {
+            if (item->reference > 0)
+            {
+                if (LootTemplate const* referenced = LootTemplates_Reference.GetLootFor(item->reference))
+                    referenced->CollectItems(out, depth + 1);
+            }
+            else
+                out.push_back(item);
+        }
+    };
+
+    collect(Entries);
+    for (LootGroup* group : Groups)
+        if (group)
+        {
+            collect(*group->GetExplicitlyChancedItemList());
+            collect(*group->GetEqualChancedItemList());
+        }
 }
 
 // Calls processor of corresponding LootTemplate (which handles everything including references)
@@ -544,6 +590,8 @@ bool Loot::FillLoot(uint32 lootId, LootStore const& store, Player* lootOwner, bo
         return false;
 
     lootOwnerGUID = lootOwner->GetGUID();
+    Creature* sharedSource = lootSource ? lootSource->ToCreature() : nullptr;
+    sharedQuestLoot = sharedSource && &store == &LootTemplates_Creature && sharedSource->IsSharedQuestTarget();
 
     LootTemplate const* tab = store.GetLootFor(lootId);
 
@@ -551,14 +599,29 @@ bool Loot::FillLoot(uint32 lootId, LootStore const& store, Player* lootOwner, bo
     {
         if (!noEmptyError)
             LOG_ERROR("sql.sql", "Table '{}' loot id #{} used but it doesn't have records.", store.GetName(), lootId);
-        return false;
     }
 
-    items.reserve(MAX_NR_LOOT_ITEMS);
+    // These two personal containers guarantee twenty distinct Fortune Scrolls.
+    // Ordinary creature/object/item loot keeps the standard eighteen-slot cap.
+    maxItemCount = &store == &LootTemplates_Item &&
+        (lootId == 1278048 || lootId == 1278049) ? 20 : MAX_NR_LOOT_ITEMS;
+    fixedMoneyLoot = &store == &LootTemplates_Item && (lootId == 1478051 || lootId == 1478052);
+    items.reserve(maxItemCount);
     quest_items.reserve(MAX_NR_QUEST_ITEMS);
 
     // Initial group is 0, top level set to True
-    tab->Process(*this, store, lootMode, lootOwner, 0, true);          // Processing is done there, callback via Loot::AddItem()
+    if (tab)
+        tab->Process(*this, store, lootMode, lootOwner, 0, true);      // Processing is done there, callback via Loot::AddItem()
+
+    bool const equippedGear = &store == &LootTemplates_Creature && lootSource
+        && AscensionEquippedGearLoot::AddLoot(lootSource->ToCreature(), *this, lootMode);
+    if (!tab)
+    {
+        if (!equippedGear)
+            return false;
+        static LootTemplate const emptyTemplate;
+        tab = &emptyTemplate;
+    }
 
     sScriptMgr->OnAfterLootTemplateProcess(this, tab, store, lootOwner, personal, noEmptyError, lootMode);
 
@@ -589,6 +652,12 @@ bool Loot::FillLoot(uint32 lootId, LootStore const& store, Player* lootOwner, bo
     // ... for personal loot
     else
         FillNotNormalLootFor(lootOwner);
+
+    if (sharedQuestLoot)
+        for (ObjectGuid const& guid : sharedSource->GetSharedQuestParticipants())
+            if (Player* player = ObjectAccessor::FindPlayer(guid))
+                if (!PlayerQuestItems.contains(guid))
+                    FillQuestLoot(player);
 
     return true;
 }
@@ -655,7 +724,7 @@ QuestItemList* Loot::FillFFALoot(Player* player)
 
 QuestItemList* Loot::FillQuestLoot(Player* player)
 {
-    if (items.size() == MAX_NR_LOOT_ITEMS)
+    if (items.size() >= maxItemCount)
         return nullptr;
 
     QuestItemList* ql = new QuestItemList();
@@ -668,9 +737,10 @@ QuestItemList* Loot::FillQuestLoot(Player* player)
 
         sScriptMgr->OnPlayerBeforeFillQuestLootItem(player, item);
 
-        bool allowed = item.AllowedForPlayer(player, sourceWorldObjectGUID);
+        bool allowed = item.AllowedForPlayer(player, sourceWorldObjectGUID)
+            && (!sharedQuestLoot || !item.needs_quest || player->HasQuestForItem(item.itemid));
 
-        if (!allowed && !isMasterLooter)
+        if (!allowed && (sharedQuestLoot || !isMasterLooter))
             continue;
 
         ql->push_back(QuestItem(i));
@@ -691,7 +761,7 @@ QuestItemList* Loot::FillQuestLoot(Player* player)
             }
         }
 
-        if (items.size() + ql->size() == MAX_NR_LOOT_ITEMS)
+        if (items.size() + ql->size() >= maxItemCount)
             break;
     }
 
@@ -809,7 +879,9 @@ void Loot::generateMoneyLoot(uint32 minAmount, uint32 maxAmount)
 {
     if (maxAmount > 0)
     {
-        if (maxAmount <= minAmount)
+        if (fixedMoneyLoot)
+            gold = minAmount;
+        else if (maxAmount <= minAmount)
             gold = uint32(maxAmount * sWorld->getRate(RATE_DROP_MONEY));
         else if ((maxAmount - minAmount) < 32700)
             gold = uint32(urand(minAmount, maxAmount) * sWorld->getRate(RATE_DROP_MONEY));
@@ -984,7 +1056,7 @@ ByteBuffer& operator<<(ByteBuffer& b, LootView const& lv)
 
     uint8 itemsShown = 0;
 
-    b << uint32(l.gold);                                    //gold
+    b << uint32(lv.permission == QUEST_PERMISSION ? 0 : l.gold); // gold
 
     std::size_t count_pos = b.wpos();                            // pos of item count byte
     b << uint8(0);                                          // item count placeholder
@@ -1087,6 +1159,8 @@ ByteBuffer& operator<<(ByteBuffer& b, LootView const& lv)
                 }
                 break;
             }
+        case QUEST_PERMISSION:
+            break;
         default:
             return b;
     }
@@ -1108,6 +1182,8 @@ ByteBuffer& operator<<(ByteBuffer& b, LootView const& lv)
             {
                 bool showInLoot = true;
                 bool hasQuestForItem = lv.viewer->HasQuestForItem(item.itemid, 0, false, &showInLoot);
+                if (!item.needs_quest && item.AllowedForPlayer(lv.viewer, l.sourceWorldObjectGUID))
+                    hasQuestForItem = true;
                 if (!hasQuestForItem)
                 {
                     if (!showInLoot)
@@ -1164,7 +1240,7 @@ ByteBuffer& operator<<(ByteBuffer& b, LootView const& lv)
 
     QuestItemMap const& lootPlayerFFAItems = l.GetPlayerFFAItems();
     QuestItemMap::const_iterator ffa_itr = lootPlayerFFAItems.find(lv.viewer->GetGUID());
-    if (ffa_itr != lootPlayerFFAItems.end())
+    if (lv.permission != QUEST_PERMISSION && ffa_itr != lootPlayerFFAItems.end())
     {
         QuestItemList* ffa_list = ffa_itr->second;
         for (QuestItemList::const_iterator fi = ffa_list->begin(); fi != ffa_list->end(); ++fi)
@@ -1183,7 +1259,7 @@ ByteBuffer& operator<<(ByteBuffer& b, LootView const& lv)
 
     QuestItemMap const& lootPlayerNonQuestNonFFAConditionalItems = l.GetPlayerNonQuestNonFFAConditionalItems();
     QuestItemMap::const_iterator nn_itr = lootPlayerNonQuestNonFFAConditionalItems.find(lv.viewer->GetGUID());
-    if (nn_itr != lootPlayerNonQuestNonFFAConditionalItems.end())
+    if (lv.permission != QUEST_PERMISSION && nn_itr != lootPlayerNonQuestNonFFAConditionalItems.end())
     {
         QuestItemList* conditional_list = nn_itr->second;
         for (QuestItemList::const_iterator ci = conditional_list->begin(); ci != conditional_list->end(); ++ci)

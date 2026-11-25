@@ -29,6 +29,18 @@ void ScriptMgr::OnSpellCheckCast(Spell* spell, bool strict, SpellCastResult& res
     CALL_ENABLED_HOOKS(AllSpellScript, ALLSPELLHOOK_ON_SPELL_CHECK_CAST, script->OnSpellCheckCast(spell, strict, res));
 }
 
+bool ScriptMgr::OnSpellFocusAnswered(Spell* spell)
+{
+    CALL_ENABLED_BOOLEAN_HOOKS_WITH_DEFAULT_FALSE(AllSpellScript, ALLSPELLHOOK_ON_SPELL_FOCUS_ANSWERED,
+        script->OnSpellFocusAnswered(spell));
+}
+
+bool ScriptMgr::CanIgnoreShapeshift(Spell const* spell)
+{
+    CALL_ENABLED_BOOLEAN_HOOKS_WITH_DEFAULT_FALSE(AllSpellScript, ALLSPELLHOOK_CAN_IGNORE_SHAPESHIFT,
+        script->CanIgnoreShapeshift(spell));
+}
+
 bool ScriptMgr::CanPrepare(Spell* spell, SpellCastTargets const* targets, AuraEffect const* triggeredByAura)
 {
     CALL_ENABLED_BOOLEAN_HOOKS(AllSpellScript, ALLSPELLHOOK_CAN_PREPARE, !script->CanPrepare(spell, targets, triggeredByAura));
@@ -120,6 +132,12 @@ void ScriptMgr::OnSpellSuccessfulSteal(Spell* spell, Unit* target, uint32 count)
         script->OnSpellSuccessfulSteal(spell, target, count));
 }
 
+void ScriptMgr::OnSpellSuccessfulDispel(Spell* spell, Unit* target, SpellEffIndex effect, uint32 count)
+{
+    CALL_ENABLED_HOOKS(AllSpellScript, ALLSPELLHOOK_ON_SUCCESSFUL_DISPEL,
+        script->OnSpellSuccessfulDispel(spell, target, effect, count));
+}
+
 void ScriptMgr::OnSpellInterruptDuration(Spell* spell, Unit* target, int32& duration)
 {
     CALL_ENABLED_HOOKS(AllSpellScript, ALLSPELLHOOK_ON_INTERRUPT_DURATION,
@@ -130,6 +148,18 @@ void ScriptMgr::OnSpellCritChance(Spell* spell, Unit* target, float& chance)
 {
     CALL_ENABLED_HOOKS(AllSpellScript, ALLSPELLHOOK_ON_CRIT_CHANCE,
         script->OnSpellCritChance(spell, target, chance));
+}
+
+void ScriptMgr::OnGuardianSummoned(Spell* spell, TempSummon* summon)
+{
+    CALL_ENABLED_HOOKS(AllSpellScript, ALLSPELLHOOK_ON_GUARDIAN_SUMMONED,
+        script->OnGuardianSummoned(spell, summon));
+}
+
+void ScriptMgr::OnSpellGlobalCooldown(Spell* spell, int32& duration)
+{
+    CALL_ENABLED_HOOKS(AllSpellScript, ALLSPELLHOOK_ON_GLOBAL_COOLDOWN,
+        script->OnSpellGlobalCooldown(spell, duration));
 }
 
 AllSpellScript::AllSpellScript(char const* name, std::vector<uint16> enabledHooks)

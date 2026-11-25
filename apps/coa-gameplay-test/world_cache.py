@@ -1,13 +1,14 @@
-"""An exclusively leased world schema; character/account schemas remain disposable."""
-
 import hashlib
 import json
 import os
 import re
 import secrets
+import threading
 
 IDENTIFIER = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\Z')
 OWNER_TABLE = 'coa_gameplay_cache_owner'
+MAX_CHECKSUM_WORKERS = 8
+CHECKSUM_TIMEOUT = 300
 
 
 def require(condition, message):
@@ -19,6 +20,14 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
+def read_identity(database, statement):
+    for _ in range(3):
+        value = database.sql('world', statement)
+        if value:
+            return value
+    raise ValueError('World cache identity query returned no data after three reads')
+
+
 def write_json(path, value):
     temporary = path.with_suffix('.tmp')
     temporary.write_text(json.dumps(value, indent=2) + '\n', encoding='utf-8')
@@ -26,7 +35,6 @@ def write_json(path, value):
 
 
 def input_fingerprint(root, source_config, module_source, environment=None):
-    """Invalidate on SQL/config edits, including uncommitted updates, without tying reuse to a build."""
     paths = {source_config}
     paths.update(module_source.glob('*.conf'))
     for directory in (root / 'data/sql/updates', root / 'data/sql/custom', root / 'modules'):
@@ -34,8 +42,6 @@ def input_fingerprint(root, source_config, module_source, environment=None):
             paths.update(directory.rglob('*.sql'))
     result = hashlib.sha256()
     source = os.environ if environment is None else environment
-    # Environment settings take precedence over files, including gameplay and migration controls.
-    # Only the digest is persisted: database connection variables may contain credentials.
     result.update(json.dumps({key: value for key, value in source.items() if key.startswith('AC_')},
                              sort_keys=True).encode())
     for path in sorted(paths):
@@ -43,6 +49,65 @@ def input_fingerprint(root, source_config, module_source, environment=None):
         with path.open('rb') as stream:
             result.update(hashlib.file_digest(stream, 'sha256').digest())
     return result.hexdigest()
+
+
+def run_parallel(function, items, workers):
+    items = list(items)
+    results = [None] * len(items)
+    if workers <= 1 or len(items) <= 1:
+        for index, item in enumerate(items):
+            results[index] = function(item)
+        return results
+    pending = iter(enumerate(items))
+    lock = threading.Lock()
+    stop = threading.Event()
+    failures = []
+
+    def work():
+        while not stop.is_set():
+            with lock:
+                entry = next(pending, None)
+            if entry is None:
+                return
+            index, item = entry
+            try:
+                results[index] = function(item)
+            except BaseException as error:
+                with lock:
+                    failures.append(error)
+                stop.set()
+
+    threads = []
+    try:
+        for _ in range(min(workers, len(items))):
+            thread = threading.Thread(target=work)
+            thread.start()
+            threads.append(thread)
+    except BaseException:
+        stop.set()
+        raise
+    finally:
+        try:
+            for thread in threads:
+                thread.join()
+        except BaseException:
+            stop.set()
+            for thread in threads:
+                thread.join()
+            raise
+    if failures:
+        raise failures[0]
+    return results
+
+
+def checksum_batches(database, name, tables):
+    workers = max(1, min(getattr(database, 'copy_workers', 1), MAX_CHECKSUM_WORKERS, len(tables)))
+    statements = [
+        'CHECKSUM TABLE ' + ', '.join(f'`{name}`.`{table}`' for table in tables[index::workers]) + ' EXTENDED;'
+        for index in range(workers)
+    ]
+    return run_parallel(lambda statement: database.sql('world', statement, timeout=CHECKSUM_TIMEOUT).splitlines(),
+                        statements, workers)
 
 
 def world_fingerprint(database, name):
@@ -57,17 +122,18 @@ def world_fingerprint(database, name):
             tables.append(table)
     require(tables, 'World database is empty')
     tables.sort()
-    names = ', '.join(f'`{name}`.`{table}`' for table in tables)
-    # EXTENDED works for InnoDB. QUICK can return NULL instead of checking the data.
-    checksums = database.sql('world', f'CHECKSUM TABLE {names} EXTENDED;', timeout=300).splitlines()
     expected = {f'{name}.{table}' for table in tables}
     values = {}
-    for row in checksums:
-        table, checksum = row.split('\t')
-        require(table in expected and checksum.isdecimal(), 'World checksum unavailable; use --fresh-databases')
-        values[table.split('.', 1)[1]] = checksum
+    for checksums in checksum_batches(database, name, tables):
+        for row in checksums:
+            table, checksum = row.split('\t')
+            require(table in expected and checksum.isdecimal(), 'World checksum unavailable; use --fresh-databases')
+            values[table.split('.', 1)[1]] = checksum
     require(len(values) == len(tables), 'Incomplete world checksums')
-    definitions = database.sql('world', '\n'.join(f'SHOW CREATE TABLE `{name}`.`{table}`;' for table in tables))
+    for _ in range(3):
+        definitions = database.sql('world', '\n'.join(f'SHOW CREATE TABLE `{name}`.`{table}`;' for table in tables))
+        if len(definitions.splitlines()) == len(tables):
+            break
     require(len(definitions.splitlines()) == len(tables), 'Incomplete world table definitions')
     programs = database.sql('world',
                             f"SELECT (SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA='{name}')"
@@ -83,8 +149,9 @@ class WorldCache:
         self.result_directory = result_directory if result_directory is not None else database.directory
         source = database.connections['world']
         self.source = source.database
-        # Include server identity so a different MySQL instance on the same port cannot inherit ownership.
-        server = database.sql('world', 'SELECT @@server_uuid;')
+        server = read_identity(database, 'SELECT @@server_uuid;')
+        require(re.fullmatch(r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}', server),
+                'World cache server identity is not a complete MySQL UUID')
         self.identity = digest([source.host, source.port, source.database, server])
         self.directory = root / self.identity[:24]
         self.path = self.directory / 'world.json'
@@ -114,7 +181,7 @@ class WorldCache:
 
     def verify_owner(self):
         require(self.name != self.source, 'Source and cached world must differ')
-        token = self.database.sql('world', f'SELECT token FROM `{self.name}`.`{OWNER_TABLE}`;')
+        token = read_identity(self.database, f'SELECT token FROM `{self.name}`.`{OWNER_TABLE}`;')
         require(token == self.metadata['token'], 'World cache ownership mismatch; refusing to reuse or drop it')
 
     def save(self):
@@ -123,7 +190,7 @@ class WorldCache:
     def drop(self):
         if not self.created_here:
             self.verify_owner()
-        self.database.sql('world', f'DROP DATABASE `{self.name}`;')
+        self.database.drop('world', self.name)
         self.owned = False
         self.created_here = False
         self.path.unlink(missing_ok=True)
@@ -155,7 +222,6 @@ class WorldCache:
                              'token': secrets.token_hex(32), 'state': 'building', 'inputs': self.inputs,
                              'source_fingerprint': source_fingerprint}
             require(self.name != self.source, 'Source and cached world must differ')
-            # Never adopt a schema on CREATE failure, even when a random name collides.
             self.database.sql('world', f'CREATE DATABASE `{self.name}` '
                               'CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;')
             self.owned = self.created_here = True
@@ -182,7 +248,6 @@ class WorldCache:
         require(record.get('waiting_for_start') in (True, 'true'),
                 'This worldserver lacks the database-cache startup barrier; rebuild or use --fresh-databases')
         self.verify_owner()
-        # Migrations finish before readiness. Record their output before any scenario actions execute.
         self.baseline = world_fingerprint(self.database, self.name)
         write_json(start_file, {'run_id': run_id})
 

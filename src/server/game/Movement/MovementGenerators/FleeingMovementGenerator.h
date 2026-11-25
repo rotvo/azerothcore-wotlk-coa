@@ -34,9 +34,12 @@ class FleeingMovementGenerator : public MovementGeneratorMedium< T, FleeingMovem
         void DoFinalize(T*);
         void DoReset(T*);
         bool DoUpdate(T*, uint32);
+        void unitSpeedChanged() override { _recalculateSpeed = true; }
+        void SetWalk(bool walk) { _walk = walk; _recalculateSpeed = true; }
 
     private:
         void SetTargetLocation(T*);
+        bool RelaunchCurrentLeg(T*);
         void GetPoint(T*, Position& position);
 
         std::unique_ptr<PathGenerator> _path;
@@ -44,6 +47,8 @@ class FleeingMovementGenerator : public MovementGeneratorMedium< T, FleeingMovem
         TimeTracker _timer;
         bool _interrupt;
         uint8 _invalidPathsCount;
+        bool _recalculateSpeed{false};
+        bool _walk{false};
 };
 
 class TimedFleeingMovementGenerator : public FleeingMovementGenerator<Creature>

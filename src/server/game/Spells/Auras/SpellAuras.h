@@ -137,6 +137,7 @@ public:
     void Update(uint32 diff, Unit* caster);
 
     time_t GetApplyTime() const { return m_applyTime; }
+    uint64 GetApplySequence() const { return m_applySequence; }
     // In-memory script snapshots belong to this aura instance, not to a unit-wide spell id.
     void SetScriptValue(uint32 key, uint64 value)
     {
@@ -214,6 +215,7 @@ public:
     bool CanBeAppliedOn(Unit* target);
     bool CheckAreaTarget(Unit* target);
     bool CanStackWith(Aura const* existingAura) const;
+    bool AscensionSharesSpecificSlot(Aura const* existingAura) const;
     bool IsAuraStronger(Aura const* newAura) const;
 
     // Proc system
@@ -284,6 +286,7 @@ protected:
     ObjectGuid const m_castItemGuid;                    // it is NOT safe to keep a pointer to the item because it may get deleted
     uint32 const m_castItemEntry;                       // when deleted, we could retrieve some information from template instead
     time_t const m_applyTime;
+    uint64 const m_applySequence;
     WorldObject* const m_owner;
 
     int32 m_maxDuration;                                // Max aura duration

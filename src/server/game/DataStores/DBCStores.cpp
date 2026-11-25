@@ -16,6 +16,7 @@
  */
 
 #include "DBCStores.h"
+#include "AscensionBattlegroundBrackets.h"
 #include "BattlegroundMgr.h"
 #include "DBCFileLoader.h"
 #include "DBCfmt.h"
@@ -28,6 +29,7 @@
 #include "TransportMgr.h"
 #include "World.h"
 #include <algorithm>
+#include <filesystem>
 #include <map>
 
 typedef std::map<uint16, uint32> AreaFlagByAreaID;
@@ -169,6 +171,7 @@ PetFamilySpellsStore sPetFamilySpellsStore;
 
 DBCStorage <SpellCastTimesEntry> sSpellCastTimesStore(SpellCastTimefmt);
 DBCStorage <SpellCategoryEntry> sSpellCategoryStore(SpellCategoryfmt);
+DBCStorage <SpellAffectEntry> sSpellAffectStore(SpellAffectfmt);
 DBCStorage <SpellDifficultyEntry> sSpellDifficultyStore(SpellDifficultyfmt);
 DBCStorage <SpellDurationEntry> sSpellDurationStore(SpellDurationfmt);
 DBCStorage <SpellFocusObjectEntry> sSpellFocusObjectStore(SpellFocusObjectfmt);
@@ -378,6 +381,11 @@ void LoadDBCStores(std::string const& dataPath)
     LOAD_DBC(sSpellStore,                           "Spell.dbc",                            "spell_dbc");
     LOAD_DBC(sSpellCastTimesStore,                  "SpellCastTimes.dbc",                   "spellcasttimes_dbc");
     LOAD_DBC(sSpellCategoryStore,                   "SpellCategory.dbc",                    "spellcategory_dbc");
+    // Optional Ascension extension; stock clients do not ship this table.
+    if (std::filesystem::exists(dbcPath + "SpellAffect.dbc"))
+        LOAD_DBC(sSpellAffectStore,                 "SpellAffect.dbc",                      nullptr);
+    else
+        LOG_WARN("server.loading", "SpellAffect.dbc not found in {}: named spell modifiers will not apply", dbcPath);
     LOAD_DBC(sSpellDifficultyStore,                 "SpellDifficulty.dbc",                  "spelldifficulty_dbc");
     LOAD_DBC(sSpellDurationStore,                   "SpellDuration.dbc",                    "spellduration_dbc");
     LOAD_DBC(sSpellFocusObjectStore,                "SpellFocusObject.dbc",                 "spellfocusobject_dbc");
@@ -427,14 +435,21 @@ void LoadDBCStores(std::string const& dataPath)
         if (charSection->Race && ((1 << (charSection->Race - 1)) & sRaceMgr->GetPlayableRaceMask()) != 0) //ignore Nonplayable races
             sCharSectionMap.insert({ charSection->GenType | (charSection->Gender << 8) | (charSection->Race << 16), charSection });
 
+    std::vector<FactionEntry*> factions;
     for (FactionEntry const* faction : sFactionStore)
     {
+        factions.push_back(const_cast<FactionEntry*>(faction));
         if (faction->team)
         {
             SimpleFactionsList& flist = sFactionTeamMap[faction->team];
             flist.push_back(faction->ID);
         }
     }
+
+    // The CoA client's Faction.dbc gives the unnamed faction 1162 Bloodsail Buccaneers' reputation index 0.
+    for (auto const& [released, owner] : ReleaseSharedReputationListIds(factions))
+        LOG_ERROR("dbc", "Faction.dbc: faction {} shares its reputation index with faction {} and has no reputation.",
+            released, owner);
 
     for (GameObjectDisplayInfoEntry const* info : sGameObjectDisplayInfoStore)
     {
@@ -726,6 +741,25 @@ SimpleFactionsList const* GetFactionTeamList(uint32 faction)
     return nullptr;
 }
 
+std::vector<std::pair<uint32, uint32>> ReleaseSharedReputationListIds(std::vector<FactionEntry*> const& factions)
+{
+    std::vector<std::pair<uint32, uint32>> released;
+    std::unordered_map<int32, uint32> owners;
+    for (FactionEntry* faction : factions)
+    {
+        if (!faction->CanHaveReputation())
+            continue;
+
+        auto const [owner, inserted] = owners.emplace(faction->reputationListID, faction->ID);
+        if (inserted)
+            continue;
+
+        released.emplace_back(faction->ID, owner->second);
+        faction->reputationListID = -1;
+    }
+    return released;
+}
+
 char const* GetPetName(uint32 petfamily, uint32 dbclang)
 {
     if (!petfamily)
@@ -856,6 +890,9 @@ MapDifficulty const* GetDownscaledMapDifficultyData(uint32 mapId, Difficulty& di
 
 PvPDifficultyEntry const* GetBattlegroundBracketByLevel(uint32 mapid, uint32 level)
 {
+    if (PvPDifficultyEntry const* widened = AscensionBattlegroundBrackets::FindByLevel(mapid, level))
+        return widened;
+
     PvPDifficultyEntry const* maxEntry = nullptr;              // used for level > max listed level case
 
     for (PvPDifficultyEntry const* entry : sPvPDifficultyStore)
@@ -878,6 +915,9 @@ PvPDifficultyEntry const* GetBattlegroundBracketByLevel(uint32 mapid, uint32 lev
 
 PvPDifficultyEntry const* GetBattlegroundBracketById(uint32 mapid, BattlegroundBracketId id)
 {
+    if (PvPDifficultyEntry const* widened = nullptr; AscensionBattlegroundBrackets::FindById(mapid, id, widened))
+        return widened;
+
     for (PvPDifficultyEntry const* entry : sPvPDifficultyStore)
         if (entry->mapId == mapid && entry->GetBracketId() == id)
             return entry;

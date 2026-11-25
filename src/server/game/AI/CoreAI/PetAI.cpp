@@ -100,12 +100,14 @@ void PetAI::_doMeleeAttack()
 bool PetAI::_canMeleeAttack()
 {
     combatRange = 0.f;
-    switch (me->GetEntry())
+    uint32 const stockEntry = GetStockPetEntry(me->GetEntry());
+    switch (stockEntry)
     {
         case ENTRY_IMP:
         case ENTRY_WATER_ELEMENTAL:
         case ENTRY_WATER_ELEMENTAL_PERM:
             {
+                bool boltOnAutocast = false;
                 for (uint8 i = 0; i < me->GetPetAutoSpellSize(); ++i)
                 {
                     uint32 spellID = me->GetPetAutoSpellOnPos(i);
@@ -123,6 +125,7 @@ bool PetAI::_canMeleeAttack()
                         case WATER_ELEMENTAL_WATERBOLT_1:
                         case WATER_ELEMENTAL_WATERBOLT_2:
                             {
+                                boltOnAutocast = true;
                                 SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellID);
                                 int32 mana = me->GetPower(POWER_MANA);
 
@@ -136,8 +139,21 @@ bool PetAI::_canMeleeAttack()
                             break;
                     }
                 }
-                return false;
+                // CoA: an Imp whose Firebolt is not on autocast (the default for a newly learned pet spell)
+                // still chases its target into melee and swings, as on TrinityCore; otherwise the pet bar's
+                // Attack command left it standing idle (#10225, #6291)
+                return stockEntry == ENTRY_IMP && !boltOnAutocast;
             }
+        // CoA: the Stormbringer Air Elemental casts Windpelt from range and holds position, like the Water Elemental
+        case ENTRY_COA_AIR_ELEMENTAL:
+            for (uint8 i = 0; i < me->GetPetAutoSpellSize(); ++i)
+                if (me->GetPetAutoSpellOnPos(i) == COA_AIR_ELEMENTAL_WINDPELT)
+                    if (SpellInfo const* windpelt = sSpellMgr->GetSpellInfo(COA_AIR_ELEMENTAL_WINDPELT))
+                    {
+                        combatRange = windpelt->GetMaxRange();
+                        return true;
+                    }
+            break;
         default:
             break;
     }
@@ -633,13 +649,7 @@ void PetAI::DoAttack(Unit* target, bool chase)
             me->GetCharmInfo()->SetIsCommandAttack(oldCmdAttack); // For passive pets commanded to attack so they will use spells
 
             if (_canMeleeAttack())
-            {
-                std::optional<ChaseAngle> chaseAngle;
-                if (combatRange == 0.f && !target->IsPlayer() && !target->IsPet())
-                    chaseAngle.emplace(float(M_PI), float(M_PI_4));
-
-                me->GetMotionMaster()->MoveChase(target, ChaseRange(0.f, combatRange), chaseAngle);
-            }
+                ChaseVictim(target);
         }
         else // (Stay && ((Aggressive || Defensive) && In Melee Range)))
         {
@@ -650,6 +660,27 @@ void PetAI::DoAttack(Unit* target, bool chase)
             me->GetMotionMaster()->MoveIdle();
         }
     }
+}
+
+void PetAI::ChaseVictim(Unit* target)
+{
+    std::optional<ChaseAngle> chaseAngle;
+    if (combatRange == 0.f && !target->IsPlayer() && !target->IsPet())
+        chaseAngle.emplace(float(M_PI), float(M_PI_4));
+
+    me->GetMotionMaster()->MoveChase(target, ChaseRange(0.f, combatRange), chaseAngle);
+}
+
+// CoA: an autocast toggle changes the chase range _canMeleeAttack derives, so reissue the active chase with it
+void PetAI::RefreshChaseRange()
+{
+    Unit* victim = me->GetVictim();
+    if (!victim || !me->GetCharmInfo() || me->GetCharmInfo()->HasCommandState(COMMAND_STAY) ||
+        me->GetMotionMaster()->GetCurrentMovementGeneratorType() != CHASE_MOTION_TYPE)
+        return;
+
+    if (_canMeleeAttack())
+        ChaseVictim(victim);
 }
 
 void PetAI::MovementInform(uint32 moveType, uint32 data)

@@ -1,0 +1,424 @@
+{
+  "schema": 1,
+  "name": "Knight of Xoroth: Demonic Rage grants Rage per Demon's Blood generated, also at the cap (#12430)",
+  "contract": [
+    "Demonic Rage 524922 reads 'Generating Demon's Blood stacks now generates $/10;s1 additional Rage' (s1 = 10, so 1",
+    "Rage). Demon's Blood is 800999; Demonfire 500906 is a different resource (both DBCs). Bloodied Blade 800997",
+    "('Melee Physical damage dealt now generates a stack of Demon's Blood', spell_proc chance 100) casts 800999 on",
+    "every melee physical hit, including at the 10-stack cap. #12430 reports no Demonic Rage at the cap: the grant was",
+    "wired to Demonfire gains instead. Brimstone Bludgeon 520005 hits the target and every enemy within 8 yd and",
+    "generates 1 Demonfire, so with three packed enemies each cast gives three Demon's Blood generations and one",
+    "Demonfire gain. The control cast without the talent logs no 524922 energize. With the talent and Demon's Blood",
+    "capped, five casts give at least 15 generations, so at least 15 energizes of 10 internal Rage each; the old",
+    "Demonfire wiring logs only one per cast (5)."
+  ],
+  "timeout_ms": 120000,
+  "players": [
+    {
+      "id": "k",
+      "race": 1,
+      "class": 17,
+      "level": 60,
+      "melee_hit_rating": 10000,
+      "expertise_rating": 10000,
+      "spell_hit_rating": 10000
+    }
+  ],
+  "creatures": [
+    {
+      "id": "e0",
+      "owner": "k",
+      "entry": 36,
+      "faction": 14,
+      "level": 60,
+      "health": 100000000,
+      "distance": 2.0
+    },
+    {
+      "id": "e1",
+      "owner": "k",
+      "entry": 36,
+      "faction": 14,
+      "level": 60,
+      "health": 100000000,
+      "distance": 2.5
+    },
+    {
+      "id": "e2",
+      "owner": "k",
+      "entry": 36,
+      "faction": 14,
+      "level": 60,
+      "health": 100000000,
+      "distance": 3.0
+    }
+  ],
+  "steps": [
+    {
+      "action": "wait",
+      "label": "Let spawn AI and level scaling settle",
+      "ms": 3000
+    },
+    {
+      "action": "add_item",
+      "actor": "k",
+      "item": 629951
+    },
+    {
+      "action": "equip",
+      "actor": "k",
+      "item": 629951,
+      "slot": 15
+    },
+    {
+      "action": "learn",
+      "actor": "k",
+      "spell": 800710
+    },
+    {
+      "action": "learn",
+      "actor": "k",
+      "spell": 800997
+    },
+    {
+      "action": "set_aura",
+      "actor": "k",
+      "label": "Force the Bloodied Blade passive aura",
+      "spell": 800997,
+      "stacks": 1
+    },
+    {
+      "action": "assert",
+      "actor": "k",
+      "label": "SETUP: Brimstone Bludgeon replaces Sever",
+      "metric": "knows_spell",
+      "spell": 520005,
+      "equals": 1,
+      "within_ms": 2000
+    },
+    {
+      "action": "assert",
+      "actor": "k",
+      "label": "SETUP: Demonic Rage is not known for the control cast",
+      "metric": "knows_spell",
+      "spell": 524922,
+      "equals": 0
+    },
+    {
+      "action": "set_power",
+      "actor": "k",
+      "power": 1,
+      "value": 0
+    },
+    {
+      "action": "snapshot",
+      "actor": "k",
+      "metric": "spell_cast_count",
+      "spell": 800999,
+      "save_as": "blood_control"
+    },
+    {
+      "action": "snapshot",
+      "actor": "k",
+      "metric": "spell_energize_count",
+      "spell": 524922,
+      "power": 1,
+      "save_as": "rage_control"
+    },
+    {
+      "action": "reset_cooldown",
+      "actor": "k",
+      "spell": 520005
+    },
+    {
+      "action": "cast",
+      "actor": "k",
+      "label": "Control Bludgeon without Demonic Rage",
+      "spell": 520005,
+      "target": "e0"
+    },
+    {
+      "action": "assert",
+      "actor": "k",
+      "label": "SETUP: the control Bludgeon hits the farthest enemy",
+      "metric": "spell_damage_count",
+      "spell": 520005,
+      "target": "e2",
+      "min": 1,
+      "within_ms": 3000
+    },
+    {
+      "action": "stop_attack",
+      "actor": "k"
+    },
+    {
+      "action": "wait",
+      "ms": 500
+    },
+    {
+      "action": "assert",
+      "actor": "k",
+      "label": "CONTROL: the Bludgeon generates Demon's Blood once per enemy hit",
+      "metric": "spell_cast_count",
+      "spell": 800999,
+      "relative_to": "blood_control",
+      "min": 3
+    },
+    {
+      "action": "assert",
+      "actor": "k",
+      "label": "CONTROL: without the talent no Demonic Rage energize is logged",
+      "metric": "spell_energize_count",
+      "spell": 524922,
+      "power": 1,
+      "relative_to": "rage_control",
+      "equals": 0
+    },
+    {
+      "action": "learn",
+      "actor": "k",
+      "spell": 524922
+    },
+    {
+      "action": "assert",
+      "actor": "k",
+      "label": "SETUP: the Demonic Rage aura is active",
+      "metric": "aura",
+      "spell": 524922,
+      "equals": 1,
+      "within_ms": 2000
+    },
+    {
+      "action": "set_aura",
+      "actor": "k",
+      "label": "Fill Demon's Blood to its base cap",
+      "spell": 800999,
+      "stacks": 10
+    },
+    {
+      "action": "assert",
+      "actor": "k",
+      "label": "SETUP: Demon's Blood is capped",
+      "metric": "aura_stacks",
+      "spell": 800999,
+      "equals": 10
+    },
+    {
+      "action": "assert",
+      "actor": "k",
+      "label": "SETUP: 10 is Demon's Blood's cap",
+      "metric": "spell_max_stacks",
+      "spell": 800999,
+      "equals": 10
+    },
+    {
+      "action": "set_power",
+      "actor": "k",
+      "power": 1,
+      "value": 0
+    },
+    {
+      "action": "snapshot",
+      "actor": "k",
+      "metric": "spell_cast_count",
+      "spell": 800999,
+      "save_as": "blood_capped"
+    },
+    {
+      "action": "snapshot",
+      "actor": "k",
+      "metric": "spell_energize_count",
+      "spell": 524922,
+      "power": 1,
+      "save_as": "rage_count"
+    },
+    {
+      "action": "snapshot",
+      "actor": "k",
+      "metric": "spell_energize_total",
+      "spell": 524922,
+      "power": 1,
+      "save_as": "rage_total"
+    },
+    {
+      "action": "wait",
+      "label": "Let the global cooldown pass",
+      "ms": 1600
+    },
+    {
+      "action": "reset_cooldown",
+      "actor": "k",
+      "spell": 520005
+    },
+    {
+      "action": "cast",
+      "actor": "k",
+      "label": "Capped Bludgeon 1/5",
+      "spell": 520005,
+      "target": "e0"
+    },
+    {
+      "action": "assert",
+      "actor": "k",
+      "label": "SETUP: capped Bludgeon 1 hits the farthest enemy",
+      "metric": "spell_damage_count",
+      "spell": 520005,
+      "target": "e2",
+      "min": 2,
+      "within_ms": 3000
+    },
+    {
+      "action": "wait",
+      "label": "Let the global cooldown pass",
+      "ms": 1600
+    },
+    {
+      "action": "reset_cooldown",
+      "actor": "k",
+      "spell": 520005
+    },
+    {
+      "action": "cast",
+      "actor": "k",
+      "label": "Capped Bludgeon 2/5",
+      "spell": 520005,
+      "target": "e0"
+    },
+    {
+      "action": "assert",
+      "actor": "k",
+      "label": "SETUP: capped Bludgeon 2 hits the farthest enemy",
+      "metric": "spell_damage_count",
+      "spell": 520005,
+      "target": "e2",
+      "min": 3,
+      "within_ms": 3000
+    },
+    {
+      "action": "wait",
+      "label": "Let the global cooldown pass",
+      "ms": 1600
+    },
+    {
+      "action": "reset_cooldown",
+      "actor": "k",
+      "spell": 520005
+    },
+    {
+      "action": "cast",
+      "actor": "k",
+      "label": "Capped Bludgeon 3/5",
+      "spell": 520005,
+      "target": "e0"
+    },
+    {
+      "action": "assert",
+      "actor": "k",
+      "label": "SETUP: capped Bludgeon 3 hits the farthest enemy",
+      "metric": "spell_damage_count",
+      "spell": 520005,
+      "target": "e2",
+      "min": 4,
+      "within_ms": 3000
+    },
+    {
+      "action": "wait",
+      "label": "Let the global cooldown pass",
+      "ms": 1600
+    },
+    {
+      "action": "reset_cooldown",
+      "actor": "k",
+      "spell": 520005
+    },
+    {
+      "action": "cast",
+      "actor": "k",
+      "label": "Capped Bludgeon 4/5",
+      "spell": 520005,
+      "target": "e0"
+    },
+    {
+      "action": "assert",
+      "actor": "k",
+      "label": "SETUP: capped Bludgeon 4 hits the farthest enemy",
+      "metric": "spell_damage_count",
+      "spell": 520005,
+      "target": "e2",
+      "min": 5,
+      "within_ms": 3000
+    },
+    {
+      "action": "wait",
+      "label": "Let the global cooldown pass",
+      "ms": 1600
+    },
+    {
+      "action": "reset_cooldown",
+      "actor": "k",
+      "spell": 520005
+    },
+    {
+      "action": "cast",
+      "actor": "k",
+      "label": "Capped Bludgeon 5/5",
+      "spell": 520005,
+      "target": "e0"
+    },
+    {
+      "action": "assert",
+      "actor": "k",
+      "label": "SETUP: capped Bludgeon 5 hits the farthest enemy",
+      "metric": "spell_damage_count",
+      "spell": 520005,
+      "target": "e2",
+      "min": 6,
+      "within_ms": 3000
+    },
+    {
+      "action": "stop_attack",
+      "actor": "k"
+    },
+    {
+      "action": "wait",
+      "ms": 500
+    },
+    {
+      "action": "assert",
+      "actor": "k",
+      "label": "SETUP: Demon's Blood stayed at the cap",
+      "metric": "aura_stacks",
+      "spell": 800999,
+      "equals": 10
+    },
+    {
+      "action": "assert",
+      "actor": "k",
+      "label": "SETUP: the capped casts generated Demon's Blood once per enemy hit",
+      "metric": "spell_cast_count",
+      "spell": 800999,
+      "relative_to": "blood_capped",
+      "min": 15
+    },
+    {
+      "action": "assert",
+      "actor": "k",
+      "label": "CONTRACT: every Demon's Blood generation at the cap logs a Demonic Rage energize",
+      "metric": "spell_energize_count",
+      "spell": 524922,
+      "power": 1,
+      "relative_to": "rage_count",
+      "min": 15
+    },
+    {
+      "action": "assert",
+      "actor": "k",
+      "label": "CONTRACT: each energize grants 1 Rage (10 internal units)",
+      "metric": "spell_energize_total",
+      "spell": 524922,
+      "power": 1,
+      "relative_to": "rage_total",
+      "min": 150
+    }
+  ]
+}

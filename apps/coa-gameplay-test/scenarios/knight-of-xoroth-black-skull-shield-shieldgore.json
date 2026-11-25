@@ -1,0 +1,74 @@
+{
+  "schema": 1,
+  "name": "Black Skull Shield cuts Shieldgore's Rage cost and raises its damage (#1109, #12946)",
+  "contract": [
+    "#12946 and #1109: Black Skull Shield 804354 reads 'Reduces the Rage cost of Shieldgore by $/10;s2 and",
+    "increases its damage by $s1%'. The installed Spell.dbc effect 1 is aura 107 (SPELL_AURA_ADD_FLAT_MODIFIER),",
+    "MiscValue 14 (SPELLMOD_COST), BasePoints -51 with DieSides 1, so -50, with classmask (0,256,0) matching",
+    "Shieldgore's family flags. Rage is stored in tenths, so -50 is the tooltip's 5 Rage ($/10;s2). The contract",
+    "in AscensionXorothContracts.cpp had set -5 (0.5 Rage), which players saw as a 1 Rage drop (#12946: 25 to",
+    "24). Shieldgore's cast spell is 804353 (the 301302 talent node only swaps Infernal Strike for it) and",
+    "spell_power_cost reads the raw tenths, so the cost must drop by exactly 50; the old -5 fails that assertion.",
+    "Effect 0 is aura 108 (SPELL_AURA_ADD_PCT_MODIFIER), MiscValue 0 (SPELLMOD_DAMAGE), 25%, same classmask;",
+    "Unit::SpellDamageBonusDone applies SPELLMOD_DAMAGE regardless of which effect index carries the damage",
+    "effect (Shieldgore's is effect 1). At level 60 the owned Sever rank is 501505",
+    "(AscensionSpellProgressionData.h)."
+  ],
+  "timeout_ms": 90000,
+  "players": [
+    {
+      "id": "knight",
+      "race": 1,
+      "class": 17,
+      "level": 60
+    }
+  ],
+  "creatures": [
+    {
+      "id": "dummy",
+      "owner": "knight",
+      "entry": 36,
+      "level": 60,
+      "health": 1000000,
+      "distance": 3
+    }
+  ],
+  "steps": [
+    { "action": "wait", "label": "Let spawn AI and level scaling settle", "ms": 5000 },
+    { "action": "snapshot", "actor": "knight", "metric": "spell_power_cost", "spell": 804353, "save_as": "cost_before" },
+    {
+      "action": "snapshot", "label": "Shieldgore's damage bonus before",
+      "actor": "knight", "metric": "spell_damage_done", "spell": 804353, "effect": 1, "target": "dummy", "save_as": "dmg_before"
+    },
+    {
+      "action": "snapshot", "label": "Sever's damage bonus before",
+      "actor": "knight", "metric": "spell_damage_done", "spell": 501505, "target": "dummy", "save_as": "sever_dmg_before"
+    },
+    {
+      "action": "assert", "label": "SETUP: Shieldgore has a nonzero unmodified Rage cost",
+      "actor": "knight", "metric": "spell_power_cost", "spell": 804353, "min": 1
+    },
+    { "action": "learn", "actor": "knight", "spell": 804354 },
+    { "action": "set_aura", "actor": "knight", "spell": 804354, "stacks": 1, "label": "Force the Black Skull Shield passive aura" },
+    { "action": "wait", "label": "Let the passive's modifiers settle", "ms": 500 },
+    {
+      "action": "assert", "label": "SETUP: the Black Skull Shield passive is active",
+      "actor": "knight", "metric": "aura", "spell": 804354, "equals": 1
+    },
+    {
+      "action": "assert", "label": "CONTRACT: Shieldgore's Rage cost drops by 5 Rage (50 tenths)",
+      "actor": "knight", "metric": "spell_power_cost", "spell": 804353, "relative_to": "cost_before",
+      "equals": -50
+    },
+    {
+      "action": "assert", "label": "CONTRACT: Shieldgore's damage bonus rises by 25%",
+      "actor": "knight", "metric": "spell_damage_done", "spell": 804353, "effect": 1, "target": "dummy",
+      "ratio_to": "dmg_before", "min": 1.24, "max": 1.26
+    },
+    {
+      "action": "assert", "label": "REGRESSION: Sever's damage bonus is untouched",
+      "actor": "knight", "metric": "spell_damage_done", "spell": 501505, "target": "dummy",
+      "ratio_to": "sever_dmg_before", "min": 0.99, "max": 1.01
+    }
+  ]
+}

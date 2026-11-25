@@ -1,11 +1,14 @@
-"""Behavioral checks for scenario validation, process failures and database ownership."""
-
 import copy
+from datetime import datetime, timedelta, timezone
 import io
 import json
+import os
 from pathlib import Path
+import re
+import subprocess
 import sys
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -13,7 +16,567 @@ from unittest.mock import patch
 import run
 
 
+class CopyServer:
+    def __init__(self, tables, obstacles=(0, 0, 0, 0, 0), fail=None, barrier=None):
+        self.tables = tables
+        self.obstacles = obstacles
+        self.fail = fail
+        self.barrier = barrier
+        self.queries = []
+        self.scripts = []
+        self.threads = set()
+        self.active = self.peak = 0
+        self.lock = threading.Lock()
+
+    def sql(self, role, statement, timeout=60):
+        if not statement.startswith(run.COPY_SESSION):
+            self.queries.append(statement)
+            if 'information_schema.VIEWS' in statement:
+                return '\t'.join(map(str, self.obstacles))
+            if 'information_schema.TABLES' in statement:
+                return '\n'.join(f'{name}\tBASE TABLE\t{size}' for name, size in self.tables.items())
+            if 'information_schema.COLUMNS' in statement:
+                return '\n'.join(f'{name}\t{column}' for name in self.tables for column in ('id', 'value'))
+            names = re.findall(r'SHOW CREATE TABLE `[^`]+`\.`([^`]+)`;', statement)
+            return '\n'.join(f'{name}\tCREATE TABLE `{name}` (\\n  `id` int NOT NULL\\n) ENGINE=InnoDB'
+                             for name in names)
+        table = re.search(r'(?:CREATE TABLE|INSERT INTO `[^`]+`\.) ?`([^`]+)`', statement)[1]
+        with self.lock:
+            self.scripts.append((table, statement))
+            self.threads.add(threading.get_ident())
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+        try:
+            if self.barrier and len(self.scripts) <= self.barrier.parties:
+                self.barrier.wait()
+            if table == self.fail:
+                raise ValueError(f'MySQL operation failed for {role}: ERROR 1062 (23000): Duplicate entry')
+        finally:
+            with self.lock:
+                self.active -= 1
+        return ''
+
+
 class RunnerTests(unittest.TestCase):
+    def with_players(self, schema, count):
+        scenario = copy.deepcopy(self.scenario)
+        scenario['schema'] = schema
+        template = scenario['players'][0]
+        scenario['players'] += [{**template, 'id': f'raider{index}'} for index in range(count - 1)]
+        return scenario
+
+    def test_schema_2_accepts_twenty_five_players(self):
+        scenario = self.with_players(2, 25)
+        self.assertIs(run.validate(scenario), scenario)
+
+    def test_schema_2_rejects_twenty_six_players(self):
+        with self.assertRaisesRegex(ValueError, r'1\.\.25 players'):
+            run.validate(self.with_players(2, 26))
+
+    def test_schema_1_still_rejects_nine_players(self):
+        with self.assertRaisesRegex(ValueError, r'1\.\.8 players'):
+            run.validate(self.with_players(1, 9))
+
+    def test_schema_2_timeout_limit(self):
+        scenario = self.with_players(2, 1)
+        scenario['timeout_ms'] = 1200000
+        self.assertIs(run.validate(scenario), scenario)
+        scenario['timeout_ms'] = 1200001
+        with self.assertRaisesRegex(ValueError, 'too large'):
+            run.validate(scenario)
+        legacy = self.with_players(1, 1)
+        legacy['timeout_ms'] = 600001
+        with self.assertRaisesRegex(ValueError, 'too large'):
+            run.validate(legacy)
+
+    def test_simulated_clock_allows_an_hour_of_game_time_and_the_real_clock_keeps_its_cap(self):
+        for schema, real_cap in ((1, 600000), (2, 1200000)):
+            scenario = self.with_players(schema, 1)
+            scenario['timeout_ms'] = 3600000
+            self.assertIs(run.validate(scenario, 'simulated'), scenario)
+            for clock in ((), ('real',)):
+                with self.assertRaisesRegex(ValueError, 'too large'):
+                    run.validate(scenario, *clock)
+            scenario['timeout_ms'] = real_cap
+            self.assertIs(run.validate(scenario, 'real'), scenario)
+            scenario['timeout_ms'] = 3600001
+            with self.assertRaisesRegex(ValueError, 'too large'):
+                run.validate(scenario, 'simulated')
+
+    def test_unknown_schema_rejected(self):
+        with self.assertRaisesRegex(ValueError, 'Unsupported scenario schema'):
+            run.validate(self.with_players(3, 1))
+
+    def test_player_account_sharing_requires_an_earlier_player(self):
+        self.scenario['players'].append({'id': 'alt', 'race': 1, 'class': 1, 'account_of': 'caster'})
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        for owner in ('alt', 'missing', 'target', '', 1, None):
+            self.scenario['players'][-1]['account_of'] = owner
+            with self.subTest(owner=owner), self.assertRaisesRegex(ValueError, 'earlier player'):
+                run.validate(self.scenario)
+
+    def test_nearby_creature_count_filters_require_valid_scope_and_ranges(self):
+        for filters in ({}, {'min_level': 16, 'max_level': 17}, {'min_home_distance': 1}, {'spell': 210866}):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'assert', 'actor': 'caster',
+                                     'metric': 'nearby_creature_count', 'entry': 2070, 'equals': 2, **filters})
+            with self.subTest(filters=filters):
+                self.assertIs(run.validate(scenario), scenario)
+        for filters in ({'min_level': 0}, {'max_level': 256}, {'min_level': 17, 'max_level': 16},
+                        {'min_level': '16'}, {'min_level': True}, {'max_level': 16.5},
+                        {'min_home_distance': -1}, {'min_home_distance': float('nan')},
+                        {'min_home_distance': float('inf')}, {'min_home_distance': True},
+                        {'spell': 0}, {'spell': '210866'}, {'spell': True}):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'assert', 'actor': 'caster',
+                                     'metric': 'nearby_creature_count', 'entry': 2070, 'equals': 2, **filters})
+            with self.subTest(filters=filters), self.assertRaises(ValueError):
+                run.validate(scenario)
+        for field in ('min_level', 'max_level', 'min_home_distance'):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'assert', 'actor': 'caster',
+                                     'metric': 'health', 'min': 1, field: 1})
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                run.validate(scenario)
+
+    def test_nearest_creature_distance_radius_is_positive_and_scoped(self):
+        step = {'action': 'assert', 'actor': 'caster', 'metric': 'nearest_creature_distance', 'entry': 15112,
+                'min': 12}
+        for radius in (1, 150, 200):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({**step, 'radius': radius})
+            with self.subTest(radius=radius):
+                self.assertIs(run.validate(scenario), scenario)
+        for radius in (0, -1, 201, float('nan'), True, '150'):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({**step, 'radius': radius})
+            with self.subTest(radius=radius), self.assertRaises(ValueError):
+                run.validate(scenario)
+        scenario = copy.deepcopy(self.scenario)
+        scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'health', 'min': 1, 'radius': 5})
+        with self.assertRaisesRegex(ValueError, 'radius only applies'):
+            run.validate(scenario)
+
+    def test_nearby_creature_health_pct_needs_a_player_and_entry(self):
+        step = {'action': 'assert', 'actor': 'caster', 'metric': 'nearby_creature_health_pct', 'entry': 12118,
+                'equals': 100}
+        scenario = copy.deepcopy(self.scenario)
+        scenario['steps'].append(step)
+        self.assertIs(run.validate(scenario), scenario)
+        for change in ({'actor': 'target'}, {'entry': 0}, {'entry': '12118'}):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({**step, **change})
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                run.validate(scenario)
+        scenario = copy.deepcopy(self.scenario)
+        scenario['steps'].append({key: value for key, value in step.items() if key != 'entry'})
+        with self.assertRaises(ValueError):
+            run.validate(scenario)
+
+    def test_lfg_dungeon_takes_an_optional_loot_method(self):
+        step = {'action': 'lfg_dungeon', 'actor': 'caster', 'dungeon': 26}
+        self.assert_step_validates(step)
+        self.assert_step_validates({**step, 'loot_method': 0})
+        for change in ({'loot_method': 5}, {'loot_method': '0'}, {'dungeon': 0}):
+            self.assert_step_rejected({**step, **change})
+
+    def test_nearby_creature_can_attack_needs_a_player_and_entry(self):
+        step = {'action': 'assert', 'actor': 'caster', 'metric': 'nearby_creature_can_attack', 'entry': 24484,
+                'equals': 0}
+        self.assert_step_validates(step)
+        for change in ({'actor': 'target'}, {'entry': 0}, {'entry': '24484'}):
+            self.assert_step_rejected({**step, **change})
+        self.assert_step_rejected({key: value for key, value in step.items() if key != 'entry'})
+
+    def test_nearby_creature_at_client_needs_a_player_and_entry(self):
+        step = {'action': 'assert', 'actor': 'caster', 'metric': 'nearby_creature_at_client', 'entry': 5720,
+                'equals': 0}
+        self.assert_step_validates(step)
+        for change in ({'actor': 'target'}, {'entry': 0}, {'entry': '5720'}):
+            self.assert_step_rejected({**step, **change})
+        self.assert_step_rejected({key: value for key, value in step.items() if key != 'entry'})
+
+    def test_nearby_creature_mount_display_needs_a_player_and_entry(self):
+        step = {'action': 'assert', 'actor': 'caster', 'metric': 'nearby_creature_mount_display', 'entry': 23543,
+                'min': 1}
+        self.assert_step_validates(step)
+        for change in ({'actor': 'target'}, {'entry': 0}, {'entry': '23543'}):
+            self.assert_step_rejected({**step, **change})
+        self.assert_step_rejected({key: value for key, value in step.items() if key != 'entry'})
+
+    def test_nearby_creature_display_needs_a_player_and_entry(self):
+        step = {'action': 'assert', 'actor': 'caster', 'metric': 'nearby_creature_display', 'entry': 24468,
+                'equals': 2790}
+        self.assert_step_validates(step)
+        for change in ({'actor': 'target'}, {'entry': 0}, {'entry': '24468'}):
+            self.assert_step_rejected({**step, **change})
+        self.assert_step_rejected({key: value for key, value in step.items() if key != 'entry'})
+
+    def test_nearby_creature_scale_needs_a_player_and_entry(self):
+        step = {'action': 'assert', 'actor': 'caster', 'metric': 'nearby_creature_scale', 'entry': 92008,
+                'equals': 3}
+        self.assert_step_validates(step)
+        for change in ({'actor': 'target'}, {'entry': 0}, {'entry': '92008'}):
+            self.assert_step_rejected({**step, **change})
+        self.assert_step_rejected({key: value for key, value in step.items() if key != 'entry'})
+
+    def test_nearby_creature_aura_count_needs_a_player_entry_and_spell(self):
+        step = {'action': 'assert', 'actor': 'caster', 'metric': 'nearby_creature_aura_count', 'entry': 23686,
+                'spell': 42074, 'min': 1}
+        self.assert_step_validates(step)
+        for change in ({'actor': 'target'}, {'entry': 0}, {'spell': 0}, {'spell': '42074'}):
+            self.assert_step_rejected({**step, **change})
+        for field in ('entry', 'spell'):
+            self.assert_step_rejected({key: value for key, value in step.items() if key != field})
+
+    def test_spell_mod_mutant_action_fields(self):
+        step = {'action': 'spell_mod_mutant', 'actor': 'caster', 'spell': 116, 'op': 12, 'percent': 100}
+        self.assert_step_validates(step)
+        self.assert_step_validates({**step, 'percent': -100})
+        self.assert_step_validates({**step, 'percent': 10000})
+        for change in ({'percent': 0}, {'percent': -101}, {'percent': 10001}, {'percent': 99.5}, {'op': 32},
+                       {'op': -1}, {'spell': 0}, {'actor': 'target'}, {'factor': 2.0}):
+            self.assert_step_rejected({**step, **change})
+        self.assert_step_rejected({key: value for key, value in step.items() if key != 'percent'})
+
+    def test_cast_until_aura_action_fields(self):
+        step = {'action': 'cast_until_aura', 'actor': 'caster', 'spell': 806060, 'target': 'target',
+                'aura': 807299, 'every_ms': 4300, 'max_casts': 10, 'cast_power': 2272, 'reset_cooldown': True}
+        self.assert_step_validates(step)
+        self.assert_step_validates({**step, 'power': 0})
+        for change in ({'max_casts': 0}, {'max_casts': 201}, {'every_ms': 0}, {'every_ms': 9001}, {'aura': 0},
+                       {'reset_cooldown': 1}, {'cast_power': -1}, {'actor': 'target'}, {'within_ms': 100}):
+            self.assert_step_rejected({**step, **change})
+        self.assert_step_rejected({key: value for key, value in step.items() if key != 'cast_power'} | {'power': 0})
+        for field in ('spell', 'aura', 'every_ms', 'max_casts'):
+            self.assert_step_rejected({key: value for key, value in step.items() if key != field})
+
+    def test_combat_avoidance_block_is_a_percent_with_an_optional_refusal(self):
+        step = {'action': 'set_combat_avoidance', 'actor': 'caster', 'block': 100}
+        self.assert_step_validates(step)
+        self.assert_step_validates({**step, 'block': 40, 'rejected': True})
+        self.assert_step_validates({**step, 'block': 0, 'rejected': False})
+        self.assert_step_rejected({**step, 'block': 0, 'rejected': True})
+        self.assert_step_validates({'action': 'set_combat_avoidance', 'actor': 'caster', 'parry': 100})
+        for change in ({'block': -1}, {'block': 101}, {'block': '100'}, {'rejected': 1}):
+            self.assert_step_rejected({**step, **change})
+        self.assert_step_rejected({'action': 'set_combat_avoidance', 'actor': 'caster', 'dodge': 10,
+                                   'rejected': True})
+
+    def test_ignore_gcd_is_a_boolean_on_a_player_cast(self):
+        step = {'action': 'cast', 'actor': 'caster', 'spell': 116, 'target': 'target', 'ignore_gcd': True}
+        self.assert_step_validates(step)
+        self.assert_step_validates({**step, 'ignore_gcd': False})
+        self.assert_step_rejected({**step, 'ignore_gcd': 1})
+        self.assert_step_rejected({**step, 'actor': 'target', 'target': 'caster'})
+
+    def test_spell_mod_mutants_metric_reads_a_player(self):
+        self.assert_step_validates({'action': 'assert', 'actor': 'caster', 'metric': 'spell_mod_mutants',
+                                    'equals': 1})
+
+    def assert_step_validates(self, step):
+        scenario = copy.deepcopy(self.scenario)
+        scenario['steps'].append(step)
+        self.assertIs(run.validate(scenario), scenario)
+
+    def assert_step_rejected(self, step):
+        scenario = copy.deepcopy(self.scenario)
+        scenario['steps'].append(step)
+        with self.subTest(step=step), self.assertRaises(ValueError):
+            run.validate(scenario)
+
+    def test_attack_nearby_needs_a_positive_radius_and_a_boolean_all(self):
+        step = {'action': 'attack_nearby', 'actor': 'caster', 'entry': 14834, 'radius': 120, 'kill': True,
+                'all': True}
+        self.assert_step_validates(step)
+        for change in ({'radius': 'wide'}, {'radius': 0}, {'radius': -5}, {'radius': float('inf')},
+                       {'radius': True}, {'all': []}, {'all': 1}, {'all': 'yes'}):
+            self.assert_step_rejected({**step, **change})
+
+    def test_spawn_placement_metrics_need_a_player_guid_and_spawn_type(self):
+        for metric in ('spawn_placement', 'spawn_ground_gap', 'spawn_submerged', 'spawn_display_state',
+                       'spawn_stand_state', 'spawn_clearance', 'spawn_headroom', 'spawn_distance'):
+            step = {'action': 'assert', 'actor': 'caster', 'metric': metric, 'guid': 6942106,
+                    'spawn_type': 'gameobject', 'equals': 0}
+            if metric == 'spawn_placement':
+                step['tolerance'] = 1
+            if metric == 'spawn_distance':
+                step.update(x=-7531, y=-3599, z=12.459)
+            self.assert_step_validates(step)
+            for change in ({'actor': 'target'}, {'guid': 0}, {'guid': '1'}, {'guid': True}, {'spawn_type': 'unit'}):
+                self.assert_step_rejected({**step, **change})
+            for missing in ('guid', 'spawn_type'):
+                self.assert_step_rejected({key: value for key, value in step.items() if key != missing})
+
+    def test_spawn_distance_needs_a_point_without_a_map(self):
+        step = {'action': 'assert', 'actor': 'caster', 'metric': 'spawn_distance', 'guid': 6941616,
+                'spawn_type': 'gameobject', 'x': -7531, 'y': -3599, 'z': 12.459, 'max': 0.05}
+        self.assert_step_validates(step)
+        for missing in ('x', 'y', 'z'):
+            self.assert_step_rejected({key: value for key, value in step.items() if key != missing})
+        for change in ({'map': 1}, {'z': 17001}, {'actor': 'target'}):
+            self.assert_step_rejected({**step, **change})
+
+    def test_point_placement_metrics_need_map_and_coordinates(self):
+        step = {'action': 'assert', 'actor': 'caster', 'metric': 'point_placement', 'map': 1, 'x': 10269.8,
+                'y': 1472.1, 'z': 1340.21, 'tolerance': 1, 'equals': 2}
+        self.assert_step_validates(step)
+        gap = {key: value for key, value in step.items() if key not in {'tolerance', 'equals'}}
+        self.assert_step_validates({**gap, 'metric': 'point_ground_gap', 'max': -1})
+        self.assert_step_rejected({key: value for key, value in step.items() if key != 'z'})
+        for change in ({'map': -1}, {'x': 17001}, {'actor': 'target'}):
+            self.assert_step_rejected({**step, **change})
+
+    def test_placement_tolerance_only_applies_to_placement_verdicts(self):
+        spawn = {'action': 'assert', 'actor': 'caster', 'metric': 'spawn_placement', 'guid': 42919,
+                 'spawn_type': 'creature', 'tolerance': 0.5, 'equals': 0}
+        point = {'action': 'assert', 'actor': 'caster', 'metric': 'point_placement', 'map': 0, 'x': 1, 'y': 2,
+                 'z': 3, 'tolerance': 0.5, 'equals': 0}
+        self.assert_step_validates(spawn)
+        self.assert_step_validates(point)
+        for step in (spawn, point):
+            self.assert_step_rejected({key: value for key, value in step.items() if key != 'tolerance'})
+            for tolerance in (0, -1, 11, '1'):
+                self.assert_step_rejected({**step, 'tolerance': tolerance})
+        self.assert_step_rejected({**spawn, 'metric': 'spawn_ground_gap'})
+        self.assert_step_rejected({'action': 'assert', 'actor': 'target', 'metric': 'health', 'tolerance': 0.5,
+                                   'min': 1})
+
+    def test_spawn_fields_only_apply_to_placement_metrics(self):
+        for field, value in (('guid', 42919), ('spawn_type', 'creature'), ('map', 0), ('z', 1)):
+            self.assert_step_rejected({'action': 'assert', 'actor': 'target', 'metric': 'health', field: value,
+                                       'min': 1})
+
+    def test_placement_audit_action_fields(self):
+        step = {'action': 'placement_audit', 'map': 1, 'zone': 493}
+        self.assert_step_validates(step)
+        self.assert_step_validates({**step, 'tolerance': 0.5})
+        self.assert_step_validates({**step, 'gameobject_types': [3, 10]})
+        self.assert_step_validates({'action': 'placement_audit', 'map': 409})
+        self.assert_step_rejected({'action': 'placement_audit', 'zone': 493})
+        for change in ({'map': -1}, {'zone': 0}, {'tolerance': 0}, {'gameobject_types': []},
+                       {'gameobject_types': [3, 3]}, {'gameobject_types': [36]}, {'gameobject_types': ['3']},
+                       {'actor': 'caster'}):
+            self.assert_step_rejected({**step, **change})
+
+    def test_placement_audit_metrics_need_an_earlier_audit(self):
+        audit = {'action': 'placement_audit', 'map': 1, 'zone': 493}
+        for metric in ('placement_audit_spawns', 'placement_audit_anomalies', 'placement_audit_event_spawns'):
+            measured = {'action': 'assert', 'actor': 'caster', 'metric': metric, 'min': 0}
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'] += [audit, measured]
+            self.assertIs(run.validate(scenario), scenario)
+            for steps in ([measured, audit], [measured]):
+                scenario = copy.deepcopy(self.scenario)
+                scenario['steps'] += steps
+                with self.subTest(metric=metric, steps=steps), self.assertRaises(ValueError):
+                    run.validate(scenario)
+
+    def test_player_packet_fields_require_a_player(self):
+        step = {'action': 'client_packet', 'actor': 'caster', 'opcode': 364, 'consumed': False}
+        self.scenario['steps'].append(step)
+        for kind in ('duel_arbiter', 'invited_battleground_type'):
+            step['fields'] = [{kind: 'caster'}]
+            self.assertIs(run.validate(self.scenario), self.scenario)
+            for actor in ('target', 'missing', 1):
+                step['fields'] = [{kind: actor}]
+                with self.subTest(kind=kind, actor=actor), self.assertRaisesRegex(ValueError, 'expected a player id'):
+                    run.validate(self.scenario)
+
+    def test_nearby_gameobject_use_owner_requires_a_player(self):
+        step = {'action': 'use_nearby_gameobject', 'actor': 'caster', 'entry': 80775, 'owner': 'caster'}
+        self.scenario['steps'].append(step)
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        for owner in ('target', 'missing', 1):
+            step['owner'] = owner
+            with self.subTest(owner=owner), self.assertRaisesRegex(ValueError, 'owner needs a player'):
+                run.validate(self.scenario)
+
+    def test_spell_cast_and_proc_counts_can_share_relative_snapshots(self):
+        for measured, captured in (('spell_cast_count', 'spell_proc_count'),
+                                   ('spell_proc_count', 'spell_cast_count')):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].extend([
+                {'action': 'snapshot', 'actor': 'caster', 'metric': captured,
+                 'spell': 653267, 'save_as': 'native_procs'},
+                {'action': 'assert', 'actor': 'caster', 'metric': measured,
+                 'spell': 653263, 'relative_to': 'native_procs', 'equals': 0},
+            ])
+            with self.subTest(measured=measured, captured=captured):
+                self.assertIs(run.validate(scenario), scenario)
+
+    def test_spell_event_relative_snapshots_reject_missing_or_incompatible_metrics(self):
+        for captured, reference in (('health', 'baseline'), ('spell_proc_count', 'missing')):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].extend([
+                {'action': 'snapshot', 'actor': 'caster', 'metric': captured,
+                 **({'spell': 653267} if captured == 'spell_proc_count' else {}),
+                 'save_as': 'baseline'},
+                {'action': 'assert', 'actor': 'caster', 'metric': 'spell_cast_count',
+                 'spell': 653263, 'relative_to': reference, 'equals': 0},
+            ])
+            with self.subTest(captured=captured, reference=reference), \
+                    self.assertRaisesRegex(ValueError, 'missing or incompatible snapshot'):
+                run.validate(scenario)
+
+    def test_spell_family_flags_require_a_spell_and_valid_word(self):
+        for word in (0, 1, 2):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'assert', 'actor': 'caster',
+                                     'metric': 'spell_family_flags', 'spell': 116, 'index': word, 'equals': 0})
+            self.assertIs(run.validate(scenario), scenario)
+        for extra in ({}, {'spell': 116, 'index': -1}, {'spell': 116, 'index': 3},
+                      {'spell': 116, 'index': True}, {'spell': 116, 'index': 0.5}):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'assert', 'actor': 'caster',
+                                     'metric': 'spell_family_flags', 'equals': 0, **extra})
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                run.validate(scenario)
+
+    def test_creature_spell_hit_bonus_and_native_metric(self):
+        for bonus in (0, 4, 100):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['creatures'][0]['spell_hit_bonus'] = bonus
+            scenario['steps'].append({'action': 'assert', 'actor': 'target',
+                                     'metric': 'spell_hit_chance', 'equals': bonus})
+            self.assertIs(run.validate(scenario), scenario)
+        for bonus in (-1, 100.1, True, float('nan'), float('inf'), '100'):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['creatures'][0]['spell_hit_bonus'] = bonus
+            with self.subTest(bonus=bonus), self.assertRaises(ValueError):
+                run.validate(scenario)
+
+    def test_creature_min_level_armor_validation(self):
+        for value in (True, False):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['creatures'][0]['min_level_armor'] = value
+            self.assertIs(run.validate(scenario), scenario)
+        for value in (1, 0, 'true', None):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['creatures'][0]['min_level_armor'] = value
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                run.validate(scenario)
+
+    def test_creature_actor_spell_immunity_metrics(self):
+        for step in ({'metric': 'spell_immune', 'spell': 853},
+                     {'metric': 'spell_effect_immune', 'spell': 61391, 'effect': 0}):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'assert', 'actor': 'target', 'target': 'caster', 'equals': 1, **step})
+            with self.subTest(metric=step['metric']):
+                self.assertIs(run.validate(scenario), scenario)
+
+    def test_creature_reaction_and_victim_target_validation(self):
+        for reaction in (0, 1, 2):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['creatures'][0]['reaction'] = reaction
+            scenario['steps'].append({'action': 'assert', 'actor': 'target', 'metric': 'victim',
+                                     'target': 'caster', 'equals': 0})
+            self.assertIs(run.validate(scenario), scenario)
+        for reaction in (-1, 3, True, 1.5, '1'):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['creatures'][0]['reaction'] = reaction
+            with self.subTest(reaction=reaction), self.assertRaises(ValueError):
+                run.validate(scenario)
+        for target in (None, 'absent'):
+            scenario = copy.deepcopy(self.scenario)
+            step = {'action': 'assert', 'actor': 'target', 'metric': 'victim', 'equals': 0}
+            if target is not None:
+                step['target'] = target
+            scenario['steps'].append(step)
+            with self.subTest(target=target), self.assertRaises(ValueError):
+                run.validate(scenario)
+
+    def test_owned_creature_count_creator_filter(self):
+        for value in (False, True, None, 0, 1, 'true'):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'owned_creature_count',
+                                      'entry': 50301, 'creator_only': value, 'equals': 0})
+            with self.subTest(value=value):
+                if type(value) is bool:
+                    self.assertIs(run.validate(scenario), scenario)
+                else:
+                    with self.assertRaises(ValueError):
+                        run.validate(scenario)
+        scenario['steps'][-1] = {'action': 'assert', 'actor': 'caster', 'metric': 'health',
+                                 'creator_only': True, 'min': 1}
+        with self.assertRaises(ValueError):
+            run.validate(scenario)
+
+    def test_owned_creature_remaining_ms_needs_a_player_and_an_entry(self):
+        for actor, entry, valid in (('caster', 50519, True), ('caster', None, False), ('target', 50519, False)):
+            scenario = copy.deepcopy(self.scenario)
+            step = {'action': 'assert', 'actor': actor, 'metric': 'owned_creature_remaining_ms', 'min': 0}
+            if entry is not None:
+                step['entry'] = entry
+            scenario['steps'].append(step)
+            with self.subTest(actor=actor, entry=entry):
+                if valid:
+                    self.assertIs(run.validate(scenario), scenario)
+                else:
+                    with self.assertRaises(ValueError):
+                        run.validate(scenario)
+
+    def test_owned_creature_count_victim_filter(self):
+        for target, valid in (('target', True), ('nobody', False)):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'owned_creature_count',
+                                      'entry': 50301, 'target': target, 'equals': 0})
+            with self.subTest(target=target):
+                if valid:
+                    self.assertIs(run.validate(scenario), scenario)
+                else:
+                    with self.assertRaises(ValueError):
+                        run.validate(scenario)
+
+    def test_profession_fixture_validation(self):
+        scenario = run.read_json(Path(__file__).parent / 'scenarios' / 'profession-xp.json')
+        self.assertIs(run.validate(scenario), scenario)
+        for step in (
+            {'action': 'set_skill', 'actor': 'gatherer', 'skill': 186, 'value': 76, 'maximum': 75},
+            {'action': 'gather_skill', 'actor': 'gatherer', 'skill': 171, 'required': 1},
+            {'action': 'gather_skill', 'actor': 'gatherer', 'skill': 186, 'required': -1},
+            {'action': 'set_xp_enabled', 'actor': 'gatherer', 'enabled': 1},
+            {'action': 'assert', 'actor': 'gatherer', 'metric': 'skill_value', 'equals': 0},
+            {'action': 'assert', 'actor': 'gatherer', 'metric': 'health', 'ratio_to': 'level_xp', 'equals': 1},
+        ):
+            invalid = copy.deepcopy(scenario)
+            invalid['steps'].append(step)
+            with self.subTest(step=step), self.assertRaises(ValueError):
+                run.validate(invalid)
+
+    def test_optional_character_names(self):
+        scenario = run.read_json(Path(__file__).parent / 'scenarios' / 'optional-character-names.json')
+        self.assertIs(run.validate(scenario), scenario)
+        for invalid in ('x' * 26, '\u0410' * 24):
+            candidate = copy.deepcopy(scenario)
+            candidate['players'][0]['name'] = invalid
+            with self.assertRaises(ValueError):
+                run.validate(candidate)
+        for field, value in [('name', None), ('actor', 'absent')]:
+            candidate = copy.deepcopy(scenario)
+            candidate['steps'][0][field] = value
+            with self.assertRaises(ValueError):
+                run.validate(candidate)
+
+    def test_personal_bank_split_packets(self):
+        for direction in ('deposit', 'withdraw'):
+            scenario = copy.deepcopy(self.scenario)
+            step = {'action': 'personal_bank_swap', 'actor': 'caster', 'entry': 475001,
+                    'direction': direction, 'count': 5}
+            if direction == 'deposit':
+                step['item'] = 2589
+            else:
+                step['inventory_slot'] = 38
+            scenario['steps'].append(step)
+            self.assertIs(run.validate(scenario), scenario)
+            for key, value in (('count', -1), ('count', 2**31), ('count', True), ('slot', 98),
+                               ('inventory_slot', 39), ('direction', 'invalid')):
+                invalid = copy.deepcopy(scenario)
+                invalid['steps'][-1][key] = value
+                with self.subTest(direction=direction, key=key, value=value):
+                    with self.assertRaises(ValueError):
+                        run.validate(invalid)
+
     def setUp(self):
         self.scenario = run.read_json(Path(__file__).parent / 'scenarios' / 'frostbolt.json')
 
@@ -37,8 +600,1121 @@ class RunnerTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertIs(run.validate(scenario), scenario)
 
+    def test_ground_effect_radius_and_size_are_caster_reads_of_a_spell(self):
+        for metric in ('dynamic_object_radius', 'dynamic_object_size'):
+            valid = copy.deepcopy(self.scenario)
+            valid['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': metric, 'spell': 502329,
+                                   'min': 0, 'max': 100})
+            with self.subTest(metric=metric):
+                self.assertIs(run.validate(valid), valid)
+            for step in ({'action': 'assert', 'actor': 'target', 'metric': metric, 'spell': 502329, 'equals': 1},
+                         {'action': 'assert', 'actor': 'caster', 'metric': metric, 'equals': 1}):
+                invalid = copy.deepcopy(self.scenario)
+                invalid['steps'].append(step)
+                with self.subTest(metric=metric, step=step), self.assertRaises(ValueError):
+                    run.validate(invalid)
+
+    def test_hour_is_an_optional_realm_local_hour(self):
+        for hour in (0, 12, 23):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['hour'] = hour
+            self.assertIs(run.validate(scenario), scenario)
+        for hour in (-1, 24, 1.5, True, '12', None):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['hour'] = hour
+            with self.subTest(hour=hour), self.assertRaisesRegex(ValueError, '^hour: '):
+                run.validate(scenario)
+
+    def test_creature_scaling_is_an_optional_boolean(self):
+        for value in (True, False):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['creature_scaling'] = value
+            self.assertIs(run.validate(scenario), scenario)
+        for value in (1, 'true', None):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['creature_scaling'] = value
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'creature_scaling must be boolean'):
+                run.validate(scenario)
+
+    def test_vanity_ownership_needs_unlock_all_and_accepts_starter_item_ids(self):
+        for value in ({'unlock_all': False}, {'unlock_all': True, 'starter_items': []},
+                      {'unlock_all': False, 'starter_items': [98457, 134987]}):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['vanity_ownership'] = value
+            self.assertIs(run.validate(scenario), scenario)
+        for value, error in (({}, 'vanity_ownership'), ({'unlock_all': 0}, 'unlock_all must be boolean'),
+                             ({'unlock_all': False, 'starter_items': 98457}, 'starter_items must be a list'),
+                             ({'unlock_all': False, 'starter_items': [0]}, 'vanity_ownership.starter_items'),
+                             ({'unlock_all': False, 'starter_items': ['98457']}, 'vanity_ownership.starter_items'),
+                             ({'unlock_all': False, 'extra': 1}, 'vanity_ownership')):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['vanity_ownership'] = value
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, error):
+                run.validate(scenario)
+
+    def test_two_side_accepts_boolean_trade_and_mail(self):
+        for value in ({}, {'trade': True}, {'trade': False, 'mail': True}):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['two_side'] = value
+            self.assertIs(run.validate(scenario), scenario)
+        for value, error in ((True, 'two_side: expected an object'), ({'trade': 1}, 'two_side.trade must be boolean'),
+                             ({'mail': 'true'}, 'two_side.mail must be boolean'), ({'auction': True}, 'two_side')):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['two_side'] = value
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, error):
+                run.validate(scenario)
+
+    def test_guild_fixture_and_raid_group_take_players(self):
+        scenario = copy.deepcopy(self.scenario)
+        scenario['players'].append({'id': 'mate', 'race': 1, 'class': 1, 'level': 20})
+        scenario['steps'][:0] = [{'action': 'group', 'actor': 'caster', 'target': 'mate', 'raid': True},
+                                 {'action': 'guild', 'actor': 'caster', 'members': ['mate'], 'name': 'Testguild'}]
+        self.assertIs(run.validate(scenario), scenario)
+        for index, change, error in ((0, {'raid': 'yes'}, 'raid must be boolean'),
+                                     (1, {'actor': 'target'}, 'guild needs a player leader'),
+                                     (1, {'members': []}, 'guild members must be other players'),
+                                     (1, {'members': ['caster']}, 'guild members must be other players'),
+                                     (1, {'members': ['target']}, 'guild members must be other players'),
+                                     (1, {'name': 'Bad1'}, 'guild name must be 1 to 24 letters')):
+            bad = copy.deepcopy(scenario)
+            bad['steps'][index].update(change)
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, error):
+                run.validate(bad)
+
+    def test_chat_log_cleanup_takes_a_day_count(self):
+        step = {'action': 'chat_log_cleanup', 'actor': 'caster', 'days_ahead': 3650}
+        scenario = copy.deepcopy(self.scenario)
+        scenario['steps'].insert(0, step)
+        self.assertIs(run.validate(scenario), scenario)
+        for change in ({'days_ahead': -1}, {'days_ahead': 3651}, {'days_ahead': '31'}, {'days_ahead': 1.5}):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].insert(0, {**step, **change})
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'days_ahead'):
+                run.validate(scenario)
+        scenario = copy.deepcopy(self.scenario)
+        scenario['steps'].insert(0, {'action': 'chat_log_cleanup', 'actor': 'caster'})
+        with self.assertRaises(ValueError):
+            run.validate(scenario)
+
+    def test_chat_log_flood_fields(self):
+        scenario = copy.deepcopy(self.scenario)
+        scenario['chat_log'] = True
+        scenario['chat_log_max_pending'] = 3
+        scenario['steps'][:0] = [
+            {'action': 'whisper', 'actor': 'caster', 'to': 'Caster', 'text': 'x', 'repeat': 5},
+            {'action': 'chat_log_cleanup', 'actor': 'caster', 'days_ahead': 31, 'background': True},
+            {'action': 'assert', 'actor': 'caster', 'metric': 'chat_log_dropped', 'equals': 2}]
+        self.assertIs(run.validate(scenario), scenario)
+        for change, error in ((lambda s: s.update(chat_log_max_pending=0), 'chat_log_max_pending'),
+                              (lambda s: s.pop('chat_log'), 'chat_log_max_pending needs chat_log'),
+                              (lambda s: s['steps'][0].update(repeat=101), 'repeat'),
+                              (lambda s: s['steps'][1].update(background=1), 'background must be boolean'),
+                              (lambda s: (s.pop('chat_log'), s.pop('chat_log_max_pending')),
+                               'chat_log_dropped needs chat_log')):
+            bad = copy.deepcopy(scenario)
+            change(bad)
+            with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
+                run.validate(bad)
+
+    def test_chat_log_rows_takes_a_type_and_filters(self):
+        rows = {'action': 'assert', 'actor': 'caster', 'metric': 'chat_log_rows', 'chat_type': 'whisper',
+                'chat_text': "it's me", 'chat_target': 'caster', 'chat_channel': 'World', 'chat_subject': 'Hello',
+                'chat_has_position': True, 'chat_has_group': False, 'chat_has_guild': False, 'chat_has_mail_id': False,
+                'chat_emote': 77, 'chat_name': 'Caster', 'chat_target_name': 'Abcdefghijkl Mnopqrstuvwx', 'equals': 1}
+        scenario = copy.deepcopy(self.scenario)
+        scenario['chat_log'] = True
+        scenario['steps'].insert(0, rows)
+        self.assertIs(run.validate(scenario), scenario)
+        for change, error in (({'chat_type': 'gossip'}, 'unknown chat_type'),
+                              ({'chat_type': None}, 'chat_type belongs to chat_log_rows'),
+                              ({'metric': 'item_count'}, 'chat_type belongs to chat_log_rows'),
+                              ({'actor': 'target'}, 'chat_log_rows needs a player'),
+                              ({'chat_target': 'target'}, 'chat_target must name a player'),
+                              ({'chat_text': 5}, 'chat_text must be a string'),
+                              ({'chat_name': 5}, 'chat_name must be a string'),
+                              ({'chat_target_name': ['x']}, 'chat_target_name must be a string'),
+                              ({'chat_has_position': 1}, 'chat_has_position must be boolean'),
+                              ({'chat_emote': -1}, 'chat_emote')):
+            step = {key: value for key, value in {**rows, **change}.items() if value is not None}
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].insert(0, step)
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, error):
+                run.validate(scenario)
+        for value in ('yes', 1):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['chat_log'] = value
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'chat_log must be boolean'):
+                run.validate(scenario)
+
+    def test_quest_log_size_accepts_the_native_and_extended_range(self):
+        for value in (25, 40, 64):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['quest_log_size'] = value
+            self.assertIs(run.validate(scenario), scenario)
+        for value in (24, 65, '30', True):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['quest_log_size'] = value
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'quest_log_size'):
+                run.validate(scenario)
+
+    def test_quest_abandon_takes_a_quest_and_an_optional_log_slot(self):
+        for step in ({'action': 'quest_abandon', 'actor': 'caster', 'quest': 7},
+                     {'action': 'quest_abandon', 'actor': 'caster', 'quest': 7, 'slot': 63}):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].insert(0, step)
+            self.assertIs(run.validate(scenario), scenario)
+        for step, error in (({'action': 'quest_abandon', 'actor': 'caster', 'quest': 7, 'slot': 64}, r'\.slot'),
+                            ({'action': 'quest_abandon', 'actor': 'caster'}, 'step 0')):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].insert(0, step)
+            with self.subTest(step=step), self.assertRaisesRegex(ValueError, error):
+                run.validate(scenario)
+
+    def test_quest_log_metrics_need_a_quest(self):
+        for metric in ('quest_log_slot', 'quest_log_client_slot', 'quest_log_client_count'):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].insert(0, {'action': 'assert', 'actor': 'caster', 'metric': metric, 'quest': 7,
+                                         'equals': 0})
+            self.assertIs(run.validate(scenario), scenario)
+            scenario['steps'][0].pop('quest')
+            with self.subTest(metric=metric), self.assertRaisesRegex(ValueError, 'quest'):
+                run.validate(scenario)
+        scenario = copy.deepcopy(self.scenario)
+        scenario['steps'].insert(0, {'action': 'assert', 'actor': 'caster', 'metric': 'quest_log_has_room',
+                                     'equals': 1})
+        self.assertIs(run.validate(scenario), scenario)
+
+    def test_addon_message_needs_a_prefix_without_tabs(self):
+        scenario = copy.deepcopy(self.scenario)
+        scenario['steps'].insert(0, {'action': 'addon_message', 'actor': 'caster', 'prefix': 'COAQLOG',
+                                     'text': 'LIST'})
+        self.assertIs(run.validate(scenario), scenario)
+        for prefix in ('', 'CO\tA', 7):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].insert(0, {'action': 'addon_message', 'actor': 'caster', 'prefix': prefix,
+                                         'text': 'LIST'})
+            with self.subTest(prefix=prefix), self.assertRaisesRegex(ValueError, 'addon_message'):
+                run.validate(scenario)
+
+    def test_whisper_contains_needs_text(self):
+        scenario = copy.deepcopy(self.scenario)
+        scenario['steps'].insert(0, {'action': 'assert', 'actor': 'caster', 'metric': 'whisper_contains',
+                                     'text': 'COAQLOG', 'equals': 1})
+        self.assertIs(run.validate(scenario), scenario)
+        scenario['steps'][0]['text'] = ' '
+        with self.assertRaisesRegex(ValueError, 'metric needs the text'):
+            run.validate(scenario)
+
+    def test_console_restore_is_one_command(self):
+        scenario = copy.deepcopy(self.scenario)
+        scenario['steps'].insert(0, {'action': 'console', 'command': 'raidphase set 2', 'restore': 'raidphase clear'})
+        self.assertIs(run.validate(scenario), scenario)
+        for restore in ('', ' ', 'raidphase clear\nserver shutdown 1', 7):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].insert(0, {'action': 'console', 'command': 'raidphase set 2', 'restore': restore})
+            with self.subTest(restore=restore), self.assertRaisesRegex(ValueError, 'one restore command'):
+                run.validate(scenario)
+        scenario = copy.deepcopy(self.scenario)
+        scenario['steps'].insert(0, {'action': 'command', 'actor': 'caster', 'command': '.gps', 'restore': '.gps'})
+        with self.assertRaisesRegex(ValueError, 'step 0'):
+            run.validate(scenario)
+
+    def test_game_event_needs_an_event_id_and_a_boolean_state(self):
+        for step in ({'action': 'game_event', 'event': 12, 'active': True},
+                     {'action': 'game_event', 'event': 12, 'active': False}):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].insert(0, step)
+            self.assertIs(run.validate(scenario), scenario)
+        for step, error in (({'action': 'game_event', 'event': 12, 'active': 1}, 'active must be boolean'),
+                            ({'action': 'game_event', 'event': 0, 'active': True}, r'\.event'),
+                            ({'action': 'game_event', 'event': 12}, 'step 0')):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].insert(0, step)
+            with self.subTest(step=step), self.assertRaisesRegex(ValueError, error):
+                run.validate(scenario)
+
+    def test_system_mail_needs_a_known_kind_and_an_item(self):
+        for kind in ('postmaster', 'reward', 'server'):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].insert(0, {'action': 'system_mail', 'actor': 'caster', 'item': 6948, 'kind': kind})
+            self.assertIs(run.validate(scenario), scenario)
+        for step, error in (({'action': 'system_mail', 'actor': 'caster', 'item': 6948, 'kind': 'gm'}, 'kind'),
+                            ({'action': 'system_mail', 'actor': 'caster', 'item': 0, 'kind': 'reward'}, r'\.item')):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].insert(0, step)
+            with self.subTest(step=step), self.assertRaisesRegex(ValueError, error):
+                run.validate(scenario)
+
+    def test_hour_timezone_is_a_posix_offset_placing_local_time_at_the_start_of_that_hour(self):
+        for utc_hour, hour, expected in ((10, 12, 'UTC-01:01'), (23, 0, 'UTC-00:01'), (1, 23, 'UTC+02:59'),
+                                         (12, 0, 'UTC-11:01'), (12, 23, 'UTC-10:01'), (5, 5, 'UTC+00:59'),
+                                         (0, 12, 'UTC-11:01'), (22, 12, 'UTC+10:59'), (18, 6, 'UTC-11:01')):
+            now = datetime(2026, 9, 24, utc_hour, 59, 30, tzinfo=timezone.utc)
+            with self.subTest(utc_hour=utc_hour, hour=hour):
+                zone = run.hour_timezone(hour, now)
+                self.assertEqual(zone, expected)
+                west = (1 if zone[3] == '+' else -1) * (int(zone[4:6]) * 60 + int(zone[7:9]))
+                self.assertEqual((utc_hour * 60 + 59 - west) % (24 * 60), hour * 60)
+        moscow = datetime(2026, 9, 25, 1, 0, tzinfo=timezone(timedelta(hours=3)))
+        self.assertEqual(run.hour_timezone(12, moscow), 'UTC+10:00')
+        with patch.object(run, 'utc_now', return_value=datetime(2026, 9, 24, 3, 0, tzinfo=timezone.utc)):
+            self.assertEqual(run.scenario_timezone({**self.scenario, 'hour': 0}), {'TZ': 'UTC+03:00'})
+        self.assertEqual(run.scenario_timezone(self.scenario), {})
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX TZ strings are checked through the C library of a child process')
+    def test_hour_timezone_starts_that_local_hour_in_a_child_process(self):
+        for utc_hour, minute, hour in ((10, 30, 12), (22, 59, 12), (23, 59, 0), (1, 0, 23), (12, 1, 0), (6, 45, 18)):
+            now = datetime(2026, 9, 24, utc_hour, minute, 30, tzinfo=timezone.utc)
+            with self.subTest(utc_hour=utc_hour, minute=minute, hour=hour):
+                local = subprocess.run(
+                    [sys.executable, '-c', f'import time; print(time.localtime({int(now.timestamp())})[3:5])'],
+                    env={**os.environ, 'TZ': run.hour_timezone(hour, now)}, capture_output=True, text=True,
+                    check=True)
+                self.assertEqual(local.stdout.strip(), f'({hour}, 0)')
+
+    def test_spell_damage_observation_filters(self):
+        step = {'action': 'assert', 'actor': 'caster', 'metric': 'spell_damage_count',
+                'spell': 116, 'target': 'target', 'pet': True, 'critical': False, 'equals': 0}
+        self.scenario['steps'].append(step)
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        for change in ({'pet': 1}, {'critical': 'false'}, {'actor': 'target'}, {'spell': None},
+                       {'metric': 'health'}):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'][-1].update(change)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                run.validate(scenario)
+
+    def test_ratio_can_compare_different_numeric_metrics(self):
+        self.scenario['steps'].extend([
+            {'action': 'snapshot', 'actor': 'caster', 'metric': 'spell_damage_total', 'spell': 116,
+             'target': 'target', 'save_as': 'damage'},
+            {'action': 'assert', 'actor': 'caster', 'metric': 'spell_heal_total', 'spell': 116,
+             'target': 'caster', 'ratio_to': 'damage', 'equals': 1},
+        ])
+        self.assertIs(run.validate(self.scenario), self.scenario)
+
+    def test_completed_cast_and_packet_count_metrics(self):
+        for metric, actor, extra in [('spell_cast_count', 'caster', {}),
+                                     ('spell_cast_count', 'target', {}),
+                                     ('spell_go_count', 'caster', {}),
+                                     ('spell_go_count', 'caster', {'pet': True}),
+                                     ('spell_go_count', 'caster', {'caster': 'caster'}),
+                                     ('spell_go_count', 'caster', {'caster': 'target'}),
+                                     ('spell_go_count', 'caster', {'entry': 50587}),
+                                     ('spell_damage_count', 'caster', {'caster': 'target'}),
+                                     ('spell_damage_total', 'caster', {'caster': 'target', 'critical': False})]:
+            with self.subTest(metric=metric, actor=actor, extra=extra):
+                scenario = copy.deepcopy(self.scenario)
+                scenario['steps'].append({'action': 'assert', 'actor': actor, 'metric': metric,
+                                          'spell': 116, 'equals': 0, **extra})
+                self.assertIs(run.validate(scenario), scenario)
+                del scenario['steps'][-1]['spell']
+                with self.assertRaises(ValueError):
+                    run.validate(scenario)
+        for metric, actor, extra in [('spell_go_count', 'target', {}),
+                                     ('spell_cast_count', 'caster', {'pet': True}),
+                                     ('spell_go_count', 'caster', {'pet': 1}),
+                                     ('spell_go_count', 'caster', {'entry': 0}),
+                                     ('spell_go_count', 'caster', {'caster': 'missing'}),
+                                     ('spell_go_count', 'caster', {'caster': 'target', 'pet': True}),
+                                     ('spell_go_count', 'caster', {'caster': 'target', 'pet': False}),
+                                     ('spell_go_count', 'caster', {'caster': 'target', 'entry': 50587}),
+                                     ('spell_go_count', 'caster', {'entry': 50587, 'pet': True}),
+                                     ('spell_damage_count', 'caster', {'caster': 'missing'}),
+                                     ('spell_damage_count', 'caster', {'caster': 'target', 'pet': False}),
+                                     ('spell_damage_total', 'caster', {'caster': 'target', 'entry': 50587})]:
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'assert', 'actor': actor, 'metric': metric,
+                                      'spell': 116, 'equals': 0, **extra})
+            with self.subTest(metric=metric, actor=actor, extra=extra), self.assertRaises(ValueError):
+                run.validate(scenario)
+
+    def test_native_relog_and_slot_observations(self):
+        for step in [
+            {'action': 'relog', 'actor': 'caster'},
+            {'action': 'relog', 'actor': 'caster', 'race': 11},
+            {'action': 'assert', 'actor': 'caster', 'metric': 'race', 'equals': 11},
+            {'action': 'assert', 'actor': 'caster', 'metric': 'pet_native_display', 'equals': 173031},
+            {'action': 'assert', 'actor': 'caster', 'metric': 'action_button_packed', 'button': 143, 'equals': 0},
+            {'action': 'assert', 'actor': 'caster', 'metric': 'server_packet_u32', 'opcode': 1829, 'index': 1,
+             'equals': 20},
+        ]:
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append(step)
+            self.assertIs(run.validate(scenario), scenario)
+        for step in [
+            {'action': 'relog', 'actor': 'target'},
+            {'action': 'assert', 'actor': 'caster', 'metric': 'action_button_packed', 'equals': 0},
+            {'action': 'assert', 'actor': 'caster', 'metric': 'server_packet_u32', 'opcode': 1829, 'index': -1,
+             'equals': 0},
+        ]:
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append(step)
+            with self.assertRaises(ValueError):
+                run.validate(scenario)
+
+    def test_packet_float_observation_fields(self):
+        valid = {'action': 'assert', 'actor': 'caster', 'metric': 'server_packet_float',
+                 'opcode': 239, 'from_end': True, 'index': 0, 'equals': -8.6}
+        scenario = copy.deepcopy(self.scenario)
+        scenario['steps'].append(valid)
+        self.assertIs(run.validate(scenario), scenario)
+        for changes in [{'opcode': 0}, {'index': -1}, {'from_end': 1}, {'offset': 4}, {'skip_strings': 1}]:
+            with self.subTest(changes=changes):
+                scenario = copy.deepcopy(self.scenario)
+                scenario['steps'].append({**valid, **changes})
+                with self.assertRaises(ValueError):
+                    run.validate(scenario)
+        scenario = copy.deepcopy(self.scenario)
+        scenario['steps'].append({**valid, 'from_end': False, 'offset': 4})
+        self.assertIs(run.validate(scenario), scenario)
+
+    def test_pet_aura_fixture(self):
+        self.scenario['steps'].append({'action': 'set_aura', 'actor': 'caster',
+                                       'spell': 82888, 'stacks': 1, 'pet': True})
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        self.scenario['steps'][-1]['pet'] = 'true'
+        with self.assertRaises(ValueError):
+            run.validate(self.scenario)
+
+    def test_aura_effect_amount_fixture(self):
+        valid = {'action': 'set_aura', 'actor': 'caster', 'spell': 707852, 'stacks': 1, 'amount': 80}
+        for extra in ({}, {'effect': 0}, {'effect': 2, 'amount': -20}):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({**valid, **extra})
+            with self.subTest(extra=extra):
+                self.assertIs(run.validate(scenario), scenario)
+        without_amount = {key: value for key, value in valid.items() if key != 'amount'} | {'effect': 0}
+        for step in ({**valid, 'stacks': 0}, {**valid, 'effect': 3}, {**valid, 'amount': 1.5},
+                     {**valid, 'amount': 2**31}, without_amount):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append(step)
+            with self.subTest(step=step), self.assertRaises(ValueError):
+                run.validate(scenario)
+
+    def test_cancel_aura_requires_player_and_spell(self):
+        self.scenario['steps'].append({'action': 'cancel_aura', 'actor': 'caster', 'spell': 802229})
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        for change in ({'actor': 'target'}, {'actor': 'absent'}, {'spell': 0}, {'spell': -802229},
+                       {'spell': True}, {'spell': 802229.5}, {'pet': True}, {'target': 'caster'}, {'stacks': 0}):
+            invalid = copy.deepcopy(self.scenario)
+            invalid['steps'][-1].update(change)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                run.validate(invalid)
+        for field in ('actor', 'spell'):
+            invalid = copy.deepcopy(self.scenario)
+            del invalid['steps'][-1][field]
+            with self.subTest(missing=field), self.assertRaises(ValueError):
+                run.validate(invalid)
+
+    def with_encounter(self, *steps):
+        scenario = copy.deepcopy(self.scenario)
+        scenario['steps'] += [{'action': 'encounter_start', 'actor': 'caster', 'boss_entry': 36, 'radius': 30},
+                              *steps]
+        return scenario
+
+    def timeline_step(self, **fields):
+        return {'action': 'assert', 'actor': 'caster', 'metric': 'timeline_count', 'event': 'cast', 'min': 0,
+                **fields}
+
+    def test_encounter_start_requires_actor_and_boss_entry(self):
+        scenario = self.with_encounter()
+        self.assertIs(run.validate(scenario), scenario)
+        del scenario['steps'][-1]['radius']
+        self.assertIs(run.validate(scenario), scenario)
+        for change in ({'actor': 'target'}, {'actor': 'absent'}, {'boss_entry': 0}, {'boss_entry': -36},
+                       {'boss_entry': True}, {'boss_entry': 36.5}, {'radius': 0}, {'radius': 201},
+                       {'radius': -5}, {'radius': True}, {'spell': 116}):
+            invalid = self.with_encounter()
+            invalid['steps'][-1].update(change)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                run.validate(invalid)
+        for field in ('actor', 'boss_entry'):
+            invalid = self.with_encounter()
+            del invalid['steps'][-1][field]
+            with self.subTest(missing=field), self.assertRaises(ValueError):
+                run.validate(invalid)
+        twice = self.with_encounter({'action': 'encounter_start', 'actor': 'caster', 'boss_entry': 36})
+        with self.assertRaisesRegex(ValueError, 'one encounter_start'):
+            run.validate(twice)
+
+    def test_timeline_metrics_require_known_event(self):
+        metrics = ('timeline_count', 'timeline_first_ms', 'timeline_interval_min_ms', 'timeline_interval_max_ms',
+                   'timeline_interval_median_ms')
+        for metric in metrics:
+            for event in ('cast', 'aura_applied', 'aura_removed', 'death', 'enter_combat', 'evade', 'spawn',
+                          'boss_state'):
+                scenario = self.with_encounter(self.timeline_step(metric=metric, event=event))
+                with self.subTest(metric=metric, event=event):
+                    self.assertIs(run.validate(scenario), scenario)
+        for change in ({'event': 'heal'}, {'event': ''}, {'event': 1}, {'spell': 0}, {'source_entry': 0},
+                       {'source_entry': 'boss'}):
+            invalid = self.with_encounter(self.timeline_step(**change))
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                run.validate(invalid)
+        missing = self.with_encounter(self.timeline_step())
+        del missing['steps'][-1]['event']
+        with self.assertRaisesRegex(ValueError, 'event'):
+            run.validate(missing)
+        before = copy.deepcopy(self.scenario)
+        before['steps'].append(self.timeline_step())
+        with self.assertRaisesRegex(ValueError, 'encounter_start'):
+            run.validate(before)
+        other = self.with_encounter({'action': 'assert', 'actor': 'caster', 'metric': 'health', 'event': 'cast',
+                                     'min': 0})
+        with self.assertRaisesRegex(ValueError, 'timeline'):
+            run.validate(other)
+        ordered = self.with_encounter(
+            {'action': 'snapshot', 'actor': 'caster', 'metric': 'timeline_first_ms', 'event': 'spawn',
+             'save_as': 'first_spawn'},
+            self.timeline_step(metric='timeline_first_ms', event='cast', relative_to='first_spawn'))
+        self.assertIs(run.validate(ordered), ordered)
+
+    def test_timeline_state_only_with_boss_state(self):
+        for state in ('NOT_STARTED', 'IN_PROGRESS', 'FAIL', 'DONE', 'SPECIAL'):
+            scenario = self.with_encounter(self.timeline_step(event='boss_state', state=state))
+            with self.subTest(state=state):
+                self.assertIs(run.validate(scenario), scenario)
+        for event, state in (('cast', 'DONE'), ('death', 'DONE'), ('boss_state', 'done'),
+                             ('boss_state', 'TO_BE_DECIDED'), ('boss_state', 3)):
+            invalid = self.with_encounter(self.timeline_step(event=event, state=state))
+            with self.subTest(event=event, state=state), self.assertRaises(ValueError):
+                run.validate(invalid)
+
+    def test_timeline_target_actors_must_exist(self):
+        for field in ('target_actors', 'exclude_target_actors'):
+            for actors in (['caster'], ['target'], ['caster', 'target']):
+                scenario = self.with_encounter(self.timeline_step(**{field: actors}))
+                with self.subTest(field=field, actors=actors):
+                    self.assertIs(run.validate(scenario), scenario)
+            for actors in (['absent'], [], 'caster', ['caster', 'caster'], [1]):
+                invalid = self.with_encounter(self.timeline_step(**{field: actors}))
+                with self.subTest(field=field, actors=actors), self.assertRaises(ValueError):
+                    run.validate(invalid)
+
+    def event_time_step(self, **fields):
+        scenario = copy.deepcopy(self.scenario)
+        step = {'action': 'assert', 'actor': 'caster', 'metric': 'event_interval_median_ms',
+                'stream': 'spell_damage', 'spell': 116, 'min': 0, **fields}
+        scenario['steps'].append({key: value for key, value in step.items() if value is not None})
+        return scenario
+
+    def test_event_time_metrics_read_streams_without_an_encounter(self):
+        for metric in sorted(run.EVENT_TIME_METRICS):
+            for stream in sorted(run.EVENT_STREAMS):
+                spell = None if stream == 'melee_hit' else 116
+                scenario = self.event_time_step(metric=metric, stream=stream, spell=spell, since_spell=116)
+                with self.subTest(metric=metric, stream=stream):
+                    self.assertIs(run.validate(scenario), scenario)
+        for fields in ({'target': 'target', 'critical': True}, {'caster': 'caster', 'since_spell': 116},
+                       {'stream': 'melee_hit', 'spell': None, 'hand': 1, 'critical': False}):
+            scenario = self.event_time_step(**fields)
+            with self.subTest(fields=fields):
+                self.assertIs(run.validate(scenario), scenario)
+
+    def test_event_time_metrics_refuse_wrong_fields(self):
+        for fields in ({'stream': 'spell_cast'}, {'stream': None}, {'spell': None}, {'spell': 0},
+                       {'stream': 'melee_hit'}, {'stream': 'melee_hit', 'spell': None, 'target': 'target'},
+                       {'stream': 'melee_hit', 'spell': None, 'hand': 2}, {'hand': 0},
+                       {'stream': 'spell_energize', 'critical': True}, {'critical': 1}, {'target': 'absent'},
+                       {'caster': 'absent'}, {'since_spell': 0}, {'metric': 'event_first_ms'},
+                       {'actor': 'target'}, {'pet': True}, {'event': 'cast'}):
+            invalid = self.event_time_step(**fields)
+            with self.subTest(fields=fields), self.assertRaises(ValueError):
+                run.validate(invalid)
+        for field, value in (('stream', 'spell_damage'), ('since_spell', 116)):
+            other = copy.deepcopy(self.scenario)
+            other['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'spell_damage_count',
+                                   'spell': 116, field: value, 'min': 0})
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'event time metrics'):
+                run.validate(other)
+
+    def test_set_health_pct_requires_actor_and_one_target(self):
+        base = {'action': 'set_health_pct', 'actor': 'caster', 'pct': 50}
+        for extra in ({'target': 'target'}, {'entry': 36}):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({**base, **extra})
+            with self.subTest(extra=extra):
+                self.assertIs(run.validate(scenario), scenario)
+        for step in ({**base}, {**base, 'target': 'target', 'entry': 36}, {'action': 'set_health_pct', 'pct': 50,
+                     'target': 'target'}, {**base, 'target': 'absent'}, {**base, 'actor': 'target', 'entry': 36}):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append(step)
+            with self.subTest(step=step), self.assertRaises(ValueError):
+                run.validate(scenario)
+
+    def test_set_health_pct_range(self):
+        for pct, valid in ((0, False), (100, False), (1, True), (99, True), (50.5, False), ('50', False)):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'set_health_pct', 'actor': 'caster', 'target': 'target', 'pct': pct})
+            with self.subTest(pct=pct):
+                if valid:
+                    self.assertIs(run.validate(scenario), scenario)
+                else:
+                    with self.assertRaises(ValueError):
+                        run.validate(scenario)
+
+    def test_pet_autocast_via(self):
+        for via, valid in ((None, True), ('autocast', True), ('set_action', True), ('opcode', False), (1, False)):
+            step = {'action': 'pet_autocast', 'actor': 'caster', 'spell': 806016, 'enabled': False}
+            if via is not None:
+                step['via'] = via
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append(step)
+            with self.subTest(via=via):
+                if valid:
+                    self.assertIs(run.validate(scenario), scenario)
+                else:
+                    with self.assertRaises(ValueError):
+                        run.validate(scenario)
+
+    def with_role(self, **fields):
+        scenario = copy.deepcopy(self.scenario)
+        scenario['players'][0].update(fields)
+        return scenario
+
+    def test_role_requires_known_value(self):
+        for fields in ({'role': 'tank'}, {'role': 'tank', 'taunt_spell': 355, 'rotation': [801576]},
+                       {'role': 'healer', 'heal_spell': 500143}, {'role': 'melee', 'rotation': [801576]},
+                       {'role': 'ranged', 'rotation': [133, 116]}):
+            scenario = self.with_role(**fields)
+            with self.subTest(fields=fields):
+                self.assertIs(run.validate(scenario), scenario)
+        for role in ('Tank', 'dps', '', 1, None, ['tank']):
+            with self.subTest(role=role), self.assertRaisesRegex(ValueError, 'role'):
+                run.validate(self.with_role(role=role))
+        for fields in ({'rotation': [801576]}, {'heal_spell': 500143}, {'taunt_spell': 355},
+                       {'role': 'melee', 'taunt_spell': 355}, {'role': 'tank', 'heal_spell': 500143},
+                       {'role': 'healer', 'heal_spell': 500143, 'rotation': [801576]}, {'role': 'ranged'}):
+            with self.subTest(fields=fields), self.assertRaises(ValueError):
+                run.validate(self.with_role(**fields))
+
+    def test_rotation_assist_is_a_boolean_opt_in_for_a_role(self):
+        for fields in ({'role': 'ranged', 'rotation': [133], 'rotation_assist': True},
+                       {'role': 'healer', 'heal_spell': 500143, 'rotation_assist': False}):
+            scenario = self.with_role(**fields)
+            with self.subTest(fields=fields):
+                self.assertIs(run.validate(scenario), scenario)
+        for value in (1, 0, 'true', None, [True]):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'rotation_assist'):
+                run.validate(self.with_role(role='tank', rotation_assist=value))
+        with self.assertRaisesRegex(ValueError, 'need a player role'):
+            run.validate(self.with_role(rotation_assist=True))
+
+    def test_healer_requires_heal_spell(self):
+        with self.assertRaisesRegex(ValueError, 'heal_spell'):
+            run.validate(self.with_role(role='healer'))
+        for spell in (0, -1, 2**32, '500143', 1.5, None):
+            with self.subTest(spell=spell), self.assertRaisesRegex(ValueError, 'heal_spell'):
+                run.validate(self.with_role(role='healer', heal_spell=spell))
+
+    def test_rotation_spells_are_positive_ids(self):
+        for rotation in ([0], [-5], [801576, 0], ['801576'], [1.5], [], 801576, [801576, 801576]):
+            with self.subTest(rotation=rotation), self.assertRaisesRegex(ValueError, 'rotation'):
+                run.validate(self.with_role(role='melee', rotation=rotation))
+        for spell in (0, 2**32, '355'):
+            with self.subTest(taunt=spell), self.assertRaisesRegex(ValueError, 'taunt_spell'):
+                run.validate(self.with_role(role='tank', taunt_spell=spell))
+
+    def test_melee_attacks_taken_needs_a_player(self):
+        for extra in ({}, {'target': 'target'}):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'melee_attacks_taken',
+                                      'equals': 0, **extra})
+            with self.subTest(extra=extra):
+                self.assertIs(run.validate(scenario), scenario)
+        for change in ({'actor': 'target'}, {'target': 'absent'}):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'melee_attacks_taken',
+                                      'equals': 0, **change})
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                run.validate(scenario)
+
+    def test_melee_missed_taken_needs_a_player(self):
+        for extra in ({}, {'target': 'target'}):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'melee_missed_taken',
+                                      'equals': 0, **extra})
+            with self.subTest(extra=extra):
+                self.assertIs(run.validate(scenario), scenario)
+        scenario = copy.deepcopy(self.scenario)
+        scenario['steps'].append({'action': 'assert', 'actor': 'target', 'metric': 'melee_missed_taken', 'equals': 0})
+        with self.assertRaises(ValueError):
+            run.validate(scenario)
+
+    def test_charmed_needs_a_player(self):
+        scenario = copy.deepcopy(self.scenario)
+        scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'charmed', 'equals': 0})
+        self.assertIs(run.validate(scenario), scenario)
+        scenario['steps'][-1]['actor'] = 'target'
+        with self.assertRaises(ValueError):
+            run.validate(scenario)
+
+    def test_melee_attacks_taken_keeps_one_victim_state(self):
+        for extra in ({'victim_state': 3}, {'victim_state': 0, 'target': 'target'}):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'melee_attacks_taken',
+                                      'min': 0, **extra})
+            with self.subTest(extra=extra):
+                self.assertIs(run.validate(scenario), scenario)
+        for step in ({'metric': 'melee_attacks_taken', 'victim_state': 9},
+                     {'metric': 'melee_attacks_taken', 'victim_state': True},
+                     {'metric': 'melee_attack_count', 'victim_state': 3}):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'min': 0, **step})
+            with self.subTest(step=step), self.assertRaises(ValueError):
+                run.validate(scenario)
+
+    def test_melee_attack_taken_last_ms_needs_a_player_and_keeps_one_victim_state(self):
+        for extra in ({}, {'victim_state': 2}):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'melee_attack_taken_last_ms',
+                                      'min': 0, **extra})
+            with self.subTest(extra=extra):
+                self.assertIs(run.validate(scenario), scenario)
+        for change in ({'actor': 'target'}, {'victim_state': 9}, {'victim_state': True}):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'melee_attack_taken_last_ms',
+                                      'min': 0, **change})
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                run.validate(scenario)
+
+    def test_cancel_mount_requires_player(self):
+        self.scenario['steps'].append({'action': 'cancel_mount', 'actor': 'caster'})
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        for change in ({'actor': 'target'}, {'actor': 'absent'}, {'spell': 801384}):
+            invalid = copy.deepcopy(self.scenario)
+            invalid['steps'][-1].update(change)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                run.validate(invalid)
+
+    def test_stunned_observation_accepts_units(self):
+        for actor in ('caster', 'target'):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'assert', 'actor': actor, 'metric': 'stunned', 'equals': 0})
+            with self.subTest(actor=actor):
+                self.assertIs(run.validate(scenario), scenario)
+
+    def test_pet_spell_calculations(self):
+        for metric in ('spell_effect_value', 'spell_damage_done'):
+            with self.subTest(metric=metric):
+                scenario = copy.deepcopy(self.scenario)
+                scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': metric,
+                                          'spell': 116, 'target': 'target', 'pet': True, 'min': 0})
+                self.assertIs(run.validate(scenario), scenario)
+                for change in ({'pet': 1}, {'actor': 'target'}, {'critical': True}):
+                    invalid = copy.deepcopy(scenario)
+                    invalid['steps'][-1].update(change)
+                    with self.assertRaises(ValueError):
+                        run.validate(invalid)
+
+    def test_flat_coefficient_modifier_query(self):
+        self.scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'spell_effect_value',
+                                      'spell': 630874, 'flat_coefficient_modifier': 20, 'min': 0})
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        for change in ({'metric': 'spell_modifier', 'op': 24, 'base': 100}, {'pet': True},
+                       {'actor': 'target'}, {'flat_coefficient_modifier': True},
+                       {'flat_coefficient_modifier': 0.5}, {'flat_coefficient_modifier': 2**31}):
+            invalid = copy.deepcopy(self.scenario)
+            invalid['steps'][-1].update(change)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                run.validate(invalid)
+
+    def test_unlearn_all_specs_fixture(self):
+        self.scenario['steps'].append({'action': 'unlearn', 'actor': 'caster',
+                                       'spell': 116, 'all_specs': True})
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        self.scenario['steps'][-1]['all_specs'] = 1
+        with self.assertRaises(ValueError):
+            run.validate(self.scenario)
+
+    def test_healing_observation_targets(self):
+        self.scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'spell_heal_total',
+                                       'spell': 997800, 'target': 'caster', 'target_pet': True, 'equals': 0})
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        for change in ({'target_pet': 1}, {'target': 'target'}, {'metric': 'health'}, {'actor': 'target'}):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'][-1].update(change)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                run.validate(scenario)
+
+    def test_cast_at_current_pet(self):
+        self.scenario['steps'].append({'action': 'cast', 'actor': 'caster', 'spell': 801707, 'target_pet': True})
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        for change in ({'target_pet': 1}, {'target': 'target'}, {'actor': 'target'}):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'][-1].update(change)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                run.validate(scenario)
+
+    def test_spell_duration_metric_requires_a_spell(self):
+        self.scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'spell_duration_ms',
+                                       'spell': 116, 'equals': 9000})
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        del self.scenario['steps'][-1]['spell']
+        with self.assertRaisesRegex(ValueError, 'metric needs spell'):
+            run.validate(self.scenario)
+
+    def test_owned_creature_school_spell_crit_needs_entry_and_probe_spell(self):
+        self.scenario['steps'].append({'action': 'assert', 'actor': 'caster',
+                                       'metric': 'owned_creature_school_spell_crit_chance', 'entry': 50073,
+                                       'spell': 501978, 'school_mask': 16, 'min': 0, 'max': 100})
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        for field, message in (('spell', 'metric needs a magic probe spell'), ('entry', 'metric needs creature entry')):
+            scenario = copy.deepcopy(self.scenario)
+            del scenario['steps'][-1][field]
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, message):
+                run.validate(scenario)
+
+    def test_owned_creature_health_modifier_needs_entry_and_part(self):
+        self.scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'owned_creature_health_modifier',
+                                       'entry': 50073, 'part': 0, 'min': 0, 'max': 100000})
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        self.scenario['steps'][-1]['part'] = 4
+        with self.assertRaises(ValueError):
+            run.validate(self.scenario)
+        del self.scenario['steps'][-1]['part']
+        with self.assertRaisesRegex(ValueError, 'metric needs the health modifier part'):
+            run.validate(self.scenario)
+
+    def test_active_power_needs_a_power(self):
+        self.scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'active_power', 'power': 0,
+                                       'min': 0, 'max': 1})
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        del self.scenario['steps'][-1]['power']
+        with self.assertRaisesRegex(ValueError, 'metric needs the power type'):
+            run.validate(self.scenario)
+
+    def test_pet_aura_amount_needs_spell(self):
+        self.scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'pet_aura_amount',
+                                       'spell': 500939, 'effect': 1, 'equals': 5})
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        del self.scenario['steps'][-1]['spell']
+        with self.assertRaises(ValueError):
+            run.validate(self.scenario)
+
+    def test_pet_health_and_native_pvp(self):
+        self.scenario['steps'].extend([
+            {'action': 'set_health', 'actor': 'caster', 'value': 100, 'pet': True},
+            {'action': 'pvp', 'actor': 'caster', 'enabled': True},
+        ])
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        self.scenario['steps'][-1]['enabled'] = 1
+        with self.assertRaises(ValueError):
+            run.validate(self.scenario)
+
+    def test_explicit_health_maximum_and_spell_cooldown_fixtures(self):
+        self.scenario['steps'].extend([
+            {'action': 'set_health', 'actor': 'caster', 'value': 3500, 'maximum': 10000},
+            {'action': 'reset_cooldown', 'actor': 'caster', 'spell': 116},
+        ])
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        for change in ({'value': 10001}, {'maximum': 0}, {'maximum': True}, {'actor': 'target'}):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'][-2].update(change)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                run.validate(scenario)
+        del self.scenario['steps'][-1]['spell']
+        with self.assertRaises(ValueError):
+            run.validate(self.scenario)
+
+    def test_native_pet_attack(self):
+        self.scenario['steps'].append({'action': 'attack', 'actor': 'caster',
+                                       'target': 'target', 'pet': True})
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        self.scenario['steps'][-1]['pet'] = 1
+        with self.assertRaises(ValueError):
+            run.validate(self.scenario)
+
+    def test_pet_power_fixture_and_observation(self):
+        self.scenario['steps'].extend([
+            {'action': 'set_power', 'actor': 'caster', 'value': 0, 'power': 2, 'pet': True},
+            {'action': 'assert', 'actor': 'caster', 'metric': 'pet_power', 'power': 2, 'equals': 0},
+        ])
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        for index, key, value in ((-2, 'pet', 1), (-1, 'actor', 'target'), (-1, 'power', 7)):
+            invalid = copy.deepcopy(self.scenario)
+            invalid['steps'][index][key] = value
+            with self.assertRaises(ValueError):
+                run.validate(invalid)
+
+    def test_energize_observation_filters(self):
+        self.scenario['steps'].append({
+            'action': 'assert', 'actor': 'caster', 'metric': 'spell_energize_total',
+            'spell': 803348, 'power': 2, 'target': 'caster', 'target_pet': True, 'equals': 10,
+        })
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        for change in ({'critical': True}, {'pet': 1}, {'target_pet': 1}, {'spell': None},
+                       {'target': 'target'}, {'actor': 'target'}, {'power': 7}):
+            invalid = copy.deepcopy(self.scenario)
+            invalid['steps'][-1].update(change)
+            with self.assertRaises(ValueError):
+                run.validate(invalid)
+
+    def test_periodic_calculation_queries(self):
+        for metric in ('spell_damage_done', 'spell_healing_done'):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'snapshot', 'actor': 'caster', 'metric': metric,
+                                      'spell': 116, 'target': 'target', 'periodic': True, 'save_as': 'tick'})
+            self.assertIs(run.validate(scenario), scenario)
+            for change in ({'periodic': 1}, {'metric': 'spell_log_count'}):
+                invalid = copy.deepcopy(scenario)
+                invalid['steps'][-1].update(change)
+                with self.assertRaises(ValueError):
+                    run.validate(invalid)
+
+    def test_periodic_spell_damage_event_filter(self):
+        for metric in ('spell_damage_total', 'spell_damage_count'):
+            for periodic in (True, False):
+                scenario = copy.deepcopy(self.scenario)
+                scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': metric, 'spell': 116,
+                                          'target': 'target', 'periodic': periodic, 'min': 0})
+                self.assertIs(run.validate(scenario), scenario)
+            invalid = copy.deepcopy(scenario)
+            invalid['steps'][-1]['periodic'] = 0
+            with self.assertRaises(ValueError):
+                run.validate(invalid)
+
+    def test_spell_damage_taken_stacks(self):
+        valid = {'action': 'snapshot', 'actor': 'caster', 'metric': 'spell_damage_taken', 'spell': 116,
+                 'target': 'target', 'base': 1000, 'stacks': 5, 'save_as': 'taken'}
+        self.scenario['steps'].append(valid)
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        for change in ({'stacks': 0}, {'stacks': 256}, {'stacks': 2.5}, {'base': 2**31, 'stacks': 2},
+                       {'metric': 'melee_damage_taken'}):
+            invalid = copy.deepcopy(self.scenario)
+            invalid['steps'][-1].update(change)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                run.validate(invalid)
+
+    def test_movement_and_cast_observations(self):
+        self.scenario['steps'].extend([
+            {'action': 'set_moving', 'actor': 'caster', 'enabled': True},
+            {'action': 'assert', 'actor': 'caster', 'metric': 'moving', 'equals': 1},
+            {'action': 'assert', 'actor': 'target', 'metric': 'distance_2d', 'target': 'caster', 'min': 0},
+            {'action': 'assert', 'actor': 'caster', 'metric': 'cast_remaining_ms', 'spell': 116, 'min': 0},
+        ])
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        for index, key, value in ((-4, 'enabled', 1), (-4, 'actor', 'target'),
+                                   (-2, 'target', 'missing'), (-1, 'spell', None)):
+            invalid = copy.deepcopy(self.scenario)
+            invalid['steps'][index][key] = value
+            with self.assertRaises(ValueError):
+                run.validate(invalid)
+
+    def test_native_client_upload_actions(self):
+        self.scenario['steps'].extend([
+            {'action': 'specialization', 'actor': 'caster', 'id': 60, 'entries': [31194]},
+            {'action': 'advancement_rank', 'actor': 'caster', 'entry': 34422, 'rank': 1, 'refused': True},
+            {'action': 'apply_appearances', 'actor': 'caster', 'selection': {'56': 1451, '57': 0}},
+        ])
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        for index, key, value in ((-3, 'actor', 'target'), (-3, 'id', 0), (-3, 'entries', []),
+                                   (-3, 'entries', [0]), (-3, 'entries', 31194), (-2, 'rank', 4),
+                                   (-2, 'actor', 'target'), (-2, 'refused', 1), (-1, 'selection', {'x': 1}), (-1, 'selection', {'0': 1}),
+                                   (-1, 'selection', [1451]), (-1, 'actor', 'target')):
+            invalid = copy.deepcopy(self.scenario)
+            invalid['steps'][index][key] = value
+            with self.assertRaises(ValueError):
+                run.validate(invalid)
+
+    def test_cast_pushback_observation_requires_player(self):
+        self.scenario['steps'].append(
+            {'action': 'assert', 'actor': 'caster', 'metric': 'cast_pushback_ms', 'equals': 0})
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        self.scenario['steps'][-1]['actor'] = 'target'
+        with self.assertRaises(ValueError):
+            run.validate(self.scenario)
+
+    def test_pet_armor_and_melee_hand_observations(self):
+        self.scenario['steps'].extend([
+            {'action': 'stop_attack', 'actor': 'caster'},
+            {'action': 'assert', 'actor': 'caster', 'metric': 'armor_reduced_damage',
+             'pet': True, 'spell': 116, 'target': 'target', 'min': 0},
+            {'action': 'assert', 'actor': 'caster', 'metric': 'melee_attack_count', 'hand': 0, 'min': 0},
+            {'action': 'assert', 'actor': 'caster', 'metric': 'melee_damage_count', 'hand': 1, 'min': 0},
+            {'action': 'assert', 'actor': 'caster', 'metric': 'forced_forward', 'equals': 0},
+        ])
+        self.assertIs(run.validate(self.scenario), self.scenario)
+        for index, key, value in ((-5, 'actor', 'target'), (-4, 'pet', 1), (-3, 'hand', 2),
+                                   (-2, 'hand', 2), (-2, 'actor', 'target')):
+            invalid = copy.deepcopy(self.scenario)
+            invalid['steps'][index][key] = value
+            with self.assertRaises(ValueError):
+                run.validate(invalid)
+
+    def test_melee_damage_outcome_filters(self):
+        for metric in ('melee_damage_count', 'melee_damage_total'):
+            step = {'action': 'assert', 'actor': 'caster', 'metric': metric, 'hand': 0, 'critical': False,
+                    'glancing': False, 'blocked': False, 'min': 0}
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append(step)
+            with self.subTest(metric=metric):
+                self.assertIs(run.validate(scenario), scenario)
+            for change in ({'critical': 'false'}, {'glancing': 0}, {'blocked': None}):
+                invalid = copy.deepcopy(scenario)
+                invalid['steps'][-1].update(change)
+                with self.subTest(metric=metric, change=change), self.assertRaises(ValueError):
+                    run.validate(invalid)
+        for key in ('glancing', 'blocked'):
+            invalid = copy.deepcopy(self.scenario)
+            invalid['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'melee_attack_count',
+                                     key: False, 'min': 0})
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                run.validate(invalid)
+
+    def test_caster_entry_filters_spell_damage_and_healing(self):
+        for metric in ('spell_damage_count', 'spell_damage_total', 'spell_heal_count', 'spell_heal_total'):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': metric, 'spell': 116,
+                                      'caster_entry': 50073, 'min': 0})
+            with self.subTest(metric=metric):
+                self.assertIs(run.validate(scenario), scenario)
+            for change in ({'caster_entry': 0}, {'caster_entry': '50073'}, {'entry': 50073}, {'pet': True}):
+                invalid = copy.deepcopy(scenario)
+                invalid['steps'][-1].update(change)
+                with self.subTest(metric=metric, change=change), self.assertRaises(ValueError):
+                    run.validate(invalid)
+        invalid = copy.deepcopy(self.scenario)
+        invalid['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'aura', 'spell': 116,
+                                 'caster_entry': 50073, 'min': 0})
+        with self.assertRaises(ValueError):
+            run.validate(invalid)
+
+    def test_target_entry_filters_spell_damage_by_the_struck_creature(self):
+        for metric in ('spell_damage_count', 'spell_damage_total'):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': metric, 'spell': 116,
+                                      'target_entry': 500483, 'min': 0})
+            with self.subTest(metric=metric):
+                self.assertIs(run.validate(scenario), scenario)
+            for change in ({'target_entry': 0}, {'target_entry': '500483'}, {'target': 'caster'}):
+                invalid = copy.deepcopy(scenario)
+                invalid['steps'][-1].update(change)
+                with self.subTest(metric=metric, change=change), self.assertRaises(ValueError):
+                    run.validate(invalid)
+        invalid = copy.deepcopy(self.scenario)
+        invalid['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'spell_heal_count', 'spell': 116,
+                                 'target_entry': 500483, 'min': 0})
+        with self.assertRaises(ValueError):
+            run.validate(invalid)
+
+    def test_spell_damage_blocked_filter(self):
+        for metric in ('spell_damage_count', 'spell_damage_total'):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': metric, 'spell': 116,
+                                      'target': 'target', 'critical': False, 'blocked': False, 'min': 0})
+            with self.subTest(metric=metric):
+                self.assertIs(run.validate(scenario), scenario)
+            invalid = copy.deepcopy(scenario)
+            invalid['steps'][-1]['blocked'] = 'false'
+            with self.subTest(metric=metric, blocked='false'), self.assertRaises(ValueError):
+                run.validate(invalid)
+        for metric, change in (('spell_heal_count', {'blocked': False}), ('spell_damage_count', {'glancing': False})):
+            invalid = copy.deepcopy(self.scenario)
+            invalid['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': metric, 'spell': 116,
+                                     'target': 'target', 'min': 0, **change})
+            with self.subTest(metric=metric, change=change), self.assertRaises(ValueError):
+                run.validate(invalid)
+
+    def test_a_fall_lands_a_player_from_a_bounded_height(self):
+        scenario = copy.deepcopy(self.scenario)
+        scenario['steps'].append({'action': 'fall', 'actor': 'caster', 'height': 30})
+        self.assertIs(run.validate(scenario), scenario)
+        for change in ({'height': 0}, {'height': 61}, {'height': 'high'}, {'actor': 'target'}, {'height': None},
+                       {'dz': 5}):
+            invalid = copy.deepcopy(scenario)
+            for key, value in change.items():
+                if value is None:
+                    del invalid['steps'][-1][key]
+                else:
+                    invalid['steps'][-1][key] = value
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                run.validate(invalid)
+
+    def test_spell_log_metrics_need_a_spell_and_take_the_caster_filters(self):
+        for metric in ('spell_log_count', 'spell_absorb_total', 'spell_resist_total', 'spell_damage_with_resist_total'):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': metric, 'spell': 116,
+                                      'caster': 'target', 'target': 'caster', 'critical': False, 'min': 0})
+            with self.subTest(metric=metric):
+                self.assertIs(run.validate(scenario), scenario)
+            invalid = copy.deepcopy(scenario)
+            del invalid['steps'][-1]['spell']
+            with self.subTest(metric=metric, spell=None), self.assertRaises(ValueError):
+                run.validate(invalid)
+
+    def test_spell_heal_absorb_total_needs_a_spell_and_takes_the_caster_target_and_critical_filters(self):
+        scenario = copy.deepcopy(self.scenario)
+        scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'spell_heal_absorb_total',
+                                  'spell': 116, 'caster': 'target', 'target': 'target', 'critical': False, 'min': 0})
+        self.assertIs(run.validate(scenario), scenario)
+        invalid = copy.deepcopy(scenario)
+        del invalid['steps'][-1]['spell']
+        with self.subTest(spell=None), self.assertRaises(ValueError):
+            run.validate(invalid)
+        invalid = copy.deepcopy(scenario)
+        invalid['steps'][-1]['critical'] = 'yes'
+        with self.subTest(critical='yes'), self.assertRaises(ValueError):
+            run.validate(invalid)
+
+    def test_spell_heal_absorb_total_refuses_the_heal_event_filters_it_does_not_read(self):
+        for key, value in (('pet', False), ('caster_entry', 36), ('target_pet', True), ('resisted', True),
+                           ('blocked', False), ('target_entry', 36)):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'spell_heal_absorb_total',
+                                      'spell': 116, key: value, 'min': 0})
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                run.validate(scenario)
+
+    def test_spell_damage_with_resist_total_refuses_the_spell_damage_event_filters(self):
+        for key, value in (('pet', False), ('resisted', True), ('blocked', False), ('target_entry', 36),
+                           ('caster_entry', 36)):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'spell_damage_with_resist_total',
+                                      'spell': 116, key: value, 'min': 0})
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                run.validate(scenario)
+
+    def test_spell_resist_chance_needs_a_magic_school_and_a_target(self):
+        scenario = copy.deepcopy(self.scenario)
+        scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'spell_resist_chance',
+                                  'school': 1, 'target': 'target', 'min': 0})
+        self.assertIs(run.validate(scenario), scenario)
+        for change in ({'school': 0}, {'school': 7}, {'school': None}, {'target': None}):
+            invalid = copy.deepcopy(scenario)
+            for key, value in change.items():
+                if value is None:
+                    del invalid['steps'][-1][key]
+                else:
+                    invalid['steps'][-1][key] = value
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                run.validate(invalid)
+
+    def test_owned_creature_metrics_need_an_entry(self):
+        for metric in ('owned_creature_damage_total', 'owned_creature_damage_count', 'owned_creature_attack_count',
+                       'owned_creature_heal_count', 'owned_creature_heal_total',
+                       'owned_creature_effective_heal_total'):
+            scenario = copy.deepcopy(self.scenario)
+            scenario['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': metric,
+                                       'entry': 50069, 'min': 0})
+            with self.subTest(metric=metric):
+                self.assertIs(run.validate(scenario), scenario)
+            del scenario['steps'][-1]['entry']
+            with self.subTest(metric=metric, missing_entry=True), self.assertRaises(ValueError):
+                run.validate(scenario)
+
     def test_malformed_scenarios_fail_before_starting_processes(self):
         for change in (
+            lambda s: s['steps'].append({'action': 'level_scaling_packet', 'actor': 'caster', 'value': 2}),
+            lambda s: s['steps'].append({'action': 'level_scaling_packet', 'actor': 'target', 'value': 1}),
+            lambda s: s['steps'].append({'action': 'client_packet', 'actor': 'caster', 'opcode': 618, 'early': 0}),
+            lambda s: s['steps'].append({'action': 'assert', 'actor': 'caster',
+                                         'metric': 'sent_level', 'equals': 57}),
+            lambda s: s['steps'].append({'action': 'assert', 'actor': 'target',
+                                         'target': 'caster', 'metric': 'view_level', 'equals': 57}),
+            lambda s: s['steps'].append({'action': 'assert', 'actor': 'caster',
+                                         'metric': 'quest_xp', 'equals': 1}),
             lambda s: s.update(schema=True),
             lambda s: s['steps'].append({'action': 'use_gameobject', 'actor': 'caster'}),
             lambda s: s['steps'].append({'action': 'use_gameobject', 'actor': 'target', 'entry': 1903510}),
@@ -64,6 +1740,9 @@ class RunnerTests(unittest.TestCase):
             lambda s: s['players'][0].update(level=True),
             lambda s: s['steps'].append({'action': 'set_level', 'actor': 'caster', 'value': 0}),
             lambda s: s['steps'].append({'action': 'set_level', 'actor': 'caster', 'value': 81}),
+            lambda s: s['steps'].append({'action': 'relog', 'actor': 'caster', 'race': 0}),
+            lambda s: s['steps'].append({'action': 'relog', 'actor': 'caster', 'race': 256}),
+            lambda s: s['steps'].append({'action': 'relog', 'actor': 'caster', 'race': True}),
             lambda s: s['steps'].append({'action': 'assert', 'actor': 'caster',
                                          'metric': 'spell_damage_done', 'spell': 686, 'equals': 1000}),
             lambda s: s['steps'].append({'action': 'assert', 'actor': 'caster',
@@ -71,10 +1750,17 @@ class RunnerTests(unittest.TestCase):
             lambda s: s['steps'].append({'action': 'assert', 'actor': 'caster',
                                          'metric': 'melee_damage_done', 'target': 'missing', 'equals': 1000}),
             lambda s: s['players'][0].update(race=0),
+            lambda s: s['players'][0].update(gender=2),
+            lambda s: s['players'][0].update(gender=True),
             lambda s: s['players'][0].update(ranged_hit_rating=-1),
             lambda s: s['players'][0].update(melee_hit_rating=-1),
+            lambda s: s['players'][0].update(melee_crit_rating=-1),
+            lambda s: s['steps'].append({'action': 'assert', 'actor': 'caster',
+                                         'metric': 'spell_cast_count', 'equals': 1}),
             lambda s: s['players'][0].update(expertise_rating=True),
+            lambda s: s['players'][0].update(allow_regeneration=0),
             lambda s: s['players'][0].update(spell_crit_rating=-1),
+            lambda s: s['players'][0].update(ranged_crit_rating=-1),
             lambda s: s['steps'].append({'action': 'who', 'actor': 'caster', 'class_mask': 2**32}),
             lambda s: s['steps'].append({'action': 'who', 'actor': 'caster', 'target': 'target'}),
             lambda s: s['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'who_class', 'equals': 1}),
@@ -96,6 +1782,8 @@ class RunnerTests(unittest.TestCase):
                                          'spell': 502329, 'equals': 1}),
             lambda s: s['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'dynamic_object',
                                          'equals': 1}),
+            lambda s: s['steps'].append({'action': 'cast', 'actor': 'target', 'spell': 10308, 'target': 'caster',
+                                         'destination': {'x': 0, 'y': 0, 'z': 0}}),
             lambda s: s['steps'].append({'action': 'cast_charm', 'actor': 'target', 'spell': 802176}),
             lambda s: s['steps'].append({'action': 'gossip_hello', 'actor': 'caster', 'target': 'missing'}),
             lambda s: s['steps'].append({'action': 'attack', 'actor': 'caster'}),
@@ -128,6 +1816,10 @@ class RunnerTests(unittest.TestCase):
                                          'entry': 36, 'equals': 0}),
             lambda s: s['steps'].append({'action': 'assert', 'actor': 'caster', 'metric': 'owned_creature_count',
                                          'entry': 36, 'caster': 'caster', 'equals': 0}),
+            lambda s: s['steps'].append({'action': 'assert', 'actor': 'caster',
+                                         'metric': 'owned_creature_weapon_damage_min', 'min': 1}),
+            lambda s: s['steps'].append({'action': 'assert', 'actor': 'caster',
+                                         'metric': 'owned_creature_spacing', 'min': 1}),
             lambda s: s.update(steps=[{'action': 'wait', 'ms': 1}]),
             lambda s: s['steps'].insert(0, {'action': 'assert', 'actor': 'target', 'metric': 'health',
                                            'relative_to': 'missing', 'equals': 0}),
@@ -173,10 +1865,154 @@ class RunnerTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 run.Connection.parse(text)
 
-    def database(self, directory):
+    def database(self, directory, copy_workers=1):
         connections = {role: run.Connection('127.0.0.1', 3306, 'user', 'secret', f'source_{role}')
                        for role in ('auth', 'characters', 'world')}
-        return run.Databases('mysql', 'mysqldump', directory, connections, '012345abcdef')
+        return run.Databases('mysql', 'mysqldump', directory, connections, '012345abcdef', copy_workers=copy_workers)
+
+    def copy_with(self, server, copy_workers=1, **arguments):
+        with tempfile.TemporaryDirectory() as temporary:
+            database = self.database(Path(temporary), copy_workers)
+            with patch.object(database, 'sql', side_effect=server.sql), \
+                    patch.object(database, 'dump_copy') as dump, patch('sys.stdout', new=io.StringIO()) as output:
+                database.copy(arguments.pop('role', 'world'), **arguments)
+            return dump, output.getvalue()
+
+    def test_copy_uses_server_side_statements_for_plain_tables(self):
+        server = CopyServer({'creature': 500, 'item_template': 900, 'version': 1})
+        dump, _ = self.copy_with(server)
+        dump.assert_not_called()
+        self.assertEqual([table for table, _ in server.scripts], ['item_template', 'creature', 'version'])
+        target = '`coa_test_012345abcdef_world`'
+        for table, script in server.scripts:
+            self.assertEqual(script, f"{run.COPY_SESSION}\nUSE {target};\n"
+                                     f'CREATE TABLE `{table}` (\n  `id` int NOT NULL\n) ENGINE=InnoDB;\n'
+                                     'USE `source_world`;\n'
+                                     f'INSERT INTO {target}.`{table}` (`id`, `value`) SELECT `id`, `value` '
+                                     f'FROM `{table}`;')
+        self.assertNotIn('LIKE', '\n'.join(script for _, script in server.scripts))
+
+    def test_copy_falls_back_to_dump_when_source_has_triggers(self):
+        for index, reason in enumerate(('views', 'triggers', 'routines', 'events', 'statement-based binary logging')):
+            server = CopyServer({'creature': 1}, obstacles=[int(position == index) for position in range(5)])
+            with self.subTest(reason=reason):
+                dump, output = self.copy_with(server, tables=('creature',), where='id > 0')
+                dump.assert_called_once_with('world', False, ('creature',), 'id > 0')
+                self.assertEqual(server.scripts, [])
+                self.assertIn(f'Copying world with mysqldump: source_world has {reason}', output)
+
+    def test_copy_schema_only_creates_tables_without_rows(self):
+        server = CopyServer({'account': 10, 'realmlist': 20})
+        self.copy_with(server, role='auth', schema_only=True)
+        self.assertEqual([table for table, _ in server.scripts], ['realmlist', 'account'])
+        for table, script in server.scripts:
+            self.assertIn(f'CREATE TABLE `{table}`', script)
+            self.assertNotIn('INSERT', script)
+        self.assertFalse(any('information_schema.COLUMNS' in statement for statement in server.queries))
+
+    def test_copy_respects_where_and_tables(self):
+        server = CopyServer({'coa_build_creator': 5, 'coa_build_creator_spell': 50, 'characters': 500})
+        where = 'entry IN (SELECT entry FROM coa_build_creator WHERE owner_account = 0)'
+        self.copy_with(server, role='characters', tables=('coa_build_creator', 'coa_build_creator_spell'), where=where)
+        self.assertEqual([table for table, _ in server.scripts], ['coa_build_creator_spell', 'coa_build_creator'])
+        for table, script in server.scripts:
+            self.assertNotIn('CREATE TABLE', script)
+            self.assertIn('USE `source_characters`;\n', script)
+            self.assertTrue(script.endswith(f'FROM `{table}` WHERE {where};'))
+        with self.assertRaisesRegex(ValueError, 'Missing source table for characters: missing'):
+            self.copy_with(CopyServer({'characters': 1}), role='characters', tables=('missing',))
+
+    def test_copy_workers_one_runs_serially(self):
+        tables = {f'table_{index}': index for index in range(6)}
+        serial = CopyServer(tables)
+        self.copy_with(serial)
+        self.assertEqual((serial.peak, serial.threads), (1, {threading.get_ident()}))
+        self.assertEqual([table for table, _ in serial.scripts], sorted(tables, key=tables.get, reverse=True))
+        concurrent = CopyServer(tables, barrier=threading.Barrier(3, timeout=10))
+        self.copy_with(concurrent, copy_workers=3)
+        self.assertEqual(concurrent.peak, 3)
+        self.assertEqual(sorted(table for table, _ in concurrent.scripts), sorted(tables))
+        with self.assertRaisesRegex(ValueError, 'copy workers'):
+            self.database(Path(tempfile.gettempdir()), copy_workers=0)
+
+    def test_partial_copy_is_dropped_on_failure(self):
+        server = CopyServer({'broken': 900, 'creature': 500, 'version': 1}, fail='broken')
+        with tempfile.TemporaryDirectory() as temporary:
+            database = self.database(Path(temporary))
+            with patch.object(database, 'sql', side_effect=server.sql), patch('sys.stdout', new=io.StringIO()):
+                with self.assertRaisesRegex(ValueError, 'Database copy failed for world: .*ERROR 1062'):
+                    database.prepare(roles=('world',))
+                self.assertEqual(database.cleanup(), [])
+            database.remove_credentials()
+        self.assertEqual([table for table, _ in server.scripts], ['broken'])
+        self.assertEqual(server.queries[-1], 'DROP DATABASE `coa_test_012345abcdef_world`;')
+
+    def test_drop_uses_long_timeout(self):
+        self.assertEqual(run.DROP_TIMEOUT, 600)
+        with tempfile.TemporaryDirectory() as temporary:
+            database = self.database(Path(temporary))
+            database.created.append('world')
+            result = subprocess.CompletedProcess([], 0, stdout='', stderr='')
+            with patch('run.subprocess.run', return_value=result) as runner:
+                self.assertEqual(database.cleanup(), [])
+            database.remove_credentials()
+        self.assertEqual(runner.call_args.args[0][0], 'mysql')
+        self.assertEqual(runner.call_args.kwargs['input'], 'DROP DATABASE `coa_test_012345abcdef_world`;')
+        self.assertEqual(runner.call_args.kwargs['timeout'], 600)
+
+    def test_cleanup_failed_keeps_error_text(self):
+        errors = [subprocess.TimeoutExpired(['mysql', '--defaults-extra-file=/private/world.cnf'], 600),
+                  ValueError('MySQL operation failed for characters: ERROR 1051 table is locked\n')]
+        with tempfile.TemporaryDirectory() as temporary:
+            database = self.database(Path(temporary))
+            database.created.extend(['characters', 'world'])
+            with patch.object(database, 'drop', side_effect=errors):
+                failures = database.cleanup()
+            database.remove_credentials()
+        self.assertEqual(failures, [
+            {'schema': 'coa_test_012345abcdef_world', 'error': 'timed out after 600 s'},
+            {'schema': 'coa_test_012345abcdef_characters',
+             'error': 'MySQL operation failed for characters: ERROR 1051 table is locked'}])
+        self.assertNotIn('private', json.dumps(failures))
+
+    def test_release_databases_records_schema_and_error(self):
+        database = SimpleNamespace(names={'world': 'coa_test_world'}, cleanup=lambda: [])
+        cache = SimpleNamespace(finish=lambda server_still_running: (_ for _ in ()).throw(ValueError('drop refused')))
+        summary = {}
+        failures = run.release_databases(database, cache, False, summary)
+        expected = [{'schema': 'coa_test_world', 'error': 'drop refused'}]
+        self.assertEqual(failures, expected)
+        self.assertEqual(summary['cleanup_failed'], expected)
+
+    def test_release_databases_keeps_the_defaults_file_out_of_the_cache_error(self):
+        timeout = subprocess.TimeoutExpired(['mysql', '--defaults-extra-file=/private/world.cnf'], 600)
+        database = SimpleNamespace(names={'world': 'coa_test_world'}, cleanup=lambda: [])
+        cache = SimpleNamespace(finish=lambda server_still_running: (_ for _ in ()).throw(timeout))
+        summary = {}
+        run.release_databases(database, cache, False, summary)
+        self.assertEqual(summary['cache_cleanup_error'], 'timed out after 600 s')
+        self.assertNotIn('private', json.dumps(summary))
+
+    def test_sql_decodes_mysql_text_as_utf8(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database = self.database(Path(temporary))
+            result = subprocess.CompletedProcess([], 0, stdout="COMMENT 'caf\u00e9'\n", stderr='')
+            with patch('run.subprocess.run', return_value=result) as runner:
+                self.assertEqual(database.sql('world', 'SHOW CREATE TABLE `t`;'), "COMMENT 'caf\u00e9'")
+            database.remove_credentials()
+        self.assertEqual(runner.call_args.kwargs['encoding'], 'utf-8')
+
+    def test_parallel_copy_failure_is_wrapped_and_the_partial_copy_dropped(self):
+        server = CopyServer({f'table_{index}': 100 - index for index in range(20)}, fail='table_0')
+        with tempfile.TemporaryDirectory() as temporary:
+            database = self.database(Path(temporary), copy_workers=3)
+            with patch.object(database, 'sql', side_effect=server.sql), patch('sys.stdout', new=io.StringIO()):
+                with self.assertRaisesRegex(ValueError, 'Database copy failed for world: .*ERROR 1062'):
+                    database.prepare(roles=('world',))
+                self.assertEqual(database.cleanup(), [])
+            database.remove_credentials()
+        self.assertIn('table_0', [table for table, _ in server.scripts])
+        self.assertEqual(server.queries[-1], 'DROP DATABASE `coa_test_012345abcdef_world`;')
 
     def test_admin_credentials_preserve_source_endpoint_and_schema(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -202,7 +2038,7 @@ class RunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             database = self.database(Path(temporary))
             statements = []
-            with patch.object(database, 'sql', side_effect=lambda role, sql: statements.append(sql)), \
+            with patch.object(database, 'sql', side_effect=lambda role, sql, timeout=60: statements.append(sql)), \
                     patch.object(database, 'copy', side_effect=ValueError('copy failed')):
                 with self.assertRaisesRegex(ValueError, 'copy failed'):
                     database.prepare()
@@ -251,7 +2087,7 @@ class RunnerTests(unittest.TestCase):
             source = directory / 'modules'
             source.mkdir()
             config = source / 'module.conf'
-            config.write_text('AscensionCompat.Enable = 1\n')
+            config.write_text('CoA.Enable = 1\n')
             staged = run.stage_modules(source, directory / 'run' / 'configs' / 'modules', {'BindIP'})
             self.assertEqual(staged[0].read_bytes(), config.read_bytes())
             config.write_text('BindIP = "0.0.0.0"\n')
@@ -345,7 +2181,7 @@ class RunnerTests(unittest.TestCase):
             directory = Path(temporary)
             source = directory / 'modules'
             source.mkdir()
-            (source / 'module.conf').write_text('AscensionCompat.Enable = 1\n')
+            (source / 'module.conf').write_text('CoA.Enable = 1\n')
             destination = directory / 'server-modules'
             destination.mkdir()
             (destination / 'other.conf').write_text('WorldDatabaseInfo = "0;0;u;p;d"\n')
@@ -385,7 +2221,10 @@ class RunnerTests(unittest.TestCase):
             config.write_text(
                 'LoginDatabaseInfo = "127.0.0.1;3306;user;secret-password;source_auth"\n'
                 'CharacterDatabaseInfo = "127.0.0.1;3306;user;secret-password;source_characters"\n'
-                'WorldDatabaseInfo = "127.0.0.1;3306;user;secret-password;source_world"\n')
+                'WorldDatabaseInfo = "127.0.0.1;3306;user;secret-password;source_world"\n'
+                'CharacterDatabase.WorkerThreads = 4\nCharacterDatabase.TransactionIsolation = "READ-COMMITTED"\n'
+                'LoginDatabase.TransactionIsolation = "SERIALIZABLE"\n'
+                'WorldDatabase.TransactionIsolation = "READ-UNCOMMITTED"\n')
             mysql = directory / 'mysql'
             mysql.write_bytes(b'')
             mysqldump = directory / 'mysqldump'
@@ -396,9 +2235,10 @@ class RunnerTests(unittest.TestCase):
                 worldserver=worldserver, config=config, mysql=mysql, mysqldump=mysqldump,
                 database_client_config=None, modules_config_dir=None,
                 server_modules_dir=directory / 'server-modules', output=output, startup_timeout=3,
-                fresh_databases=True, refresh_world=False, world_cache_dir=directory / 'cache')
+                fresh_databases=True, refresh_world=False, world_cache_dir=directory / 'cache', copy_workers=1)
             report = self.report()
             credential_dirs = []
+            server_settings = []
             real_mkdtemp = tempfile.mkdtemp
 
             def recording_mkdtemp(*a, **kw):
@@ -406,20 +2246,70 @@ class RunnerTests(unittest.TestCase):
                 credential_dirs.append(Path(path))
                 return path
 
+            def recording_process(command, *a, **kw):
+                server_settings.append(run.read_config(Path(command[-1])))
+                return report, 0
+
             with patch.object(run.tempfile, 'mkdtemp', side_effect=recording_mkdtemp), \
                     patch.object(run.secrets, 'token_hex', return_value='012345abcdef'), \
                     patch.object(run.Databases, 'prepare', lambda self, **kw: None), \
                     patch.object(run.Databases, 'cleanup', lambda self: []), \
-                    patch.object(run, 'run_process', return_value=(report, 0)):
+                    patch.object(run, 'run_process', side_effect=recording_process):
                 code = run.execute(args, self.scenario)
             self.assertEqual(code, 0)
             self.assertEqual(len(credential_dirs), 1)
+            self.assertEqual(server_settings[0]['TempDir'], credential_dirs[0].as_posix())
+            self.assertEqual({name: server_settings[0][f'CoAGameplayTest.{name}'] for name in run.CLOCK_SETTINGS},
+                             {'Clock': 'real', 'Lanes': '1', 'StepMs': '3', 'ActiveWaitCapMs': '25',
+                              'PollCapMs': '10', 'StartHour': '10'})
+            self.assertEqual(server_settings[0]['CoAGameplayTest.CaseDirectory'], '')
+            self.assertEqual({key: server_settings[0][key] for key in (
+                'LoginDatabase.WorkerThreads', 'CharacterDatabase.WorkerThreads', 'LoginDatabase.TransactionIsolation',
+                'CharacterDatabase.TransactionIsolation', 'WorldDatabase.TransactionIsolation')}, {
+                'LoginDatabase.WorkerThreads': '1', 'CharacterDatabase.WorkerThreads': '1',
+                'LoginDatabase.TransactionIsolation': '', 'CharacterDatabase.TransactionIsolation': '',
+                'WorldDatabase.TransactionIsolation': ''})
             self.assertFalse(credential_dirs[0].exists())
             self.assertFalse((output / 'worldserver.conf').exists())
             self.assertFalse(any(output.glob('*-client.cnf')))
             for path in output.rglob('*'):
                 if path.is_file():
                     self.assertNotIn('secret-password', path.read_text(encoding='utf-8', errors='replace'))
+
+    def test_execute_gives_only_an_hour_scenario_a_fixed_offset(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            (directory / 'worldserver').write_bytes(b'binary')
+            config = directory / 'worldserver.conf'
+            config.write_text(''.join(f'{key} = "127.0.0.1;3306;user;secret;source_{role}"\n'
+                                      for role, key in run.DATABASE_SETTINGS.items()))
+            for tool in ('mysql', 'mysqldump'):
+                (directory / tool).write_bytes(b'')
+            (directory / 'modules').mkdir()
+            observed = []
+
+            def recording_process(command, *a, **kw):
+                observed.append(kw['environment'])
+                return {**self.report(), 'realm_local_start': '2026-09-25 12:34:56'}, 0
+
+            with patch.object(run.Databases, 'prepare', lambda self, **kw: None), \
+                    patch.object(run.Databases, 'cleanup', lambda self: []), \
+                    patch.object(run, 'run_process', side_effect=recording_process), \
+                    patch.object(run.secrets, 'token_hex', return_value='012345abcdef'), \
+                    patch.object(run, 'utc_now', return_value=datetime(2026, 9, 24, 22, 40, tzinfo=timezone.utc)), \
+                    patch.dict(run.os.environ, {'TZ': 'Europe/Moscow'}):
+                for name, scenario in (('noon', {**self.scenario, 'hour': 12}), ('plain', self.scenario)):
+                    args = SimpleNamespace(
+                        worldserver=directory / 'worldserver', config=config, mysql=directory / 'mysql',
+                        mysqldump=directory / 'mysqldump', database_client_config=None, modules_config_dir=None,
+                        server_modules_dir=directory / name / 'modules', output=directory / name,
+                        startup_timeout=3, fresh_databases=True, refresh_world=False,
+                        world_cache_dir=directory / 'cache', copy_workers=1)
+                    self.assertEqual(run.execute(args, scenario), 0)
+            self.assertEqual([environment['TZ'] for environment in observed], ['UTC+10:40', 'Europe/Moscow'])
+            summaries = [run.read_json(directory / name / 'summary.json') for name in ('noon', 'plain')]
+            self.assertEqual([summary.get('timezone') for summary in summaries], ['UTC+10:40', None])
+            self.assertEqual({summary['realm_local_start'] for summary in summaries}, {'2026-09-25 12:34:56'})
 
     @unittest.skipUnless(hasattr(run.signal, 'SIGTERM'), 'SIGTERM is not available on this platform')
     def test_sigterm_handler_raises_and_previous_handler_is_restored(self):
@@ -433,7 +2323,8 @@ class RunnerTests(unittest.TestCase):
             installed_handlers.append(run.signal.getsignal(run.signal.SIGTERM))
             return 0
 
-        with patch.object(run, 'execute', side_effect=fake_execute):
+        with patch.object(run, 'execute', side_effect=fake_execute), \
+                patch('workflow.run_registered', side_effect=lambda args, scenario, execute: execute(args, scenario)):
             code = run.main(arguments)
         self.assertEqual(code, 0)
         self.assertEqual(len(installed_handlers), 1)

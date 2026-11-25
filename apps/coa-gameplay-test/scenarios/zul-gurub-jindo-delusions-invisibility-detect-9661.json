@@ -1,0 +1,92 @@
+{
+  "schema": 1,
+  "name": "Zul'Gurub: Delusions of Jin'do curses with its vision and one damage aura (#9661)",
+  "contract": [
+    "Delusions of Jin'do puts the vision (2118511) and the damage (2118512) on its target, the two auras the",
+    "live logs show for every curse. The vision lets the cursed player see the Shade of Jin'do (14986) itself",
+    "(zul-gurub-jindo-shade-visible-with-the-vision), so the curse no longer adds vanilla's Delusions of",
+    "Jin'do (24306) as a third debuff (testers 2026-11-16: three debuffs). The lane's own phase makes Jin'do",
+    "lose the hero once 2118512 phases the hero (see zul-gurub-jindo-resets-5800), and the leave-combat",
+    "interrupt of 24306 would strip it then too, so the missing 24306 is a control here: the proof that",
+    "the vision alone reveals the shade is the sibling scenario."
+  ],
+  "timeout_ms": 90000,
+  "location": {
+    "map": 309,
+    "x": -11515.8,
+    "y": -1275.48,
+    "z": 79.6621,
+    "o": 3.15905,
+    "ignore_access": true
+  },
+  "players": [
+    {
+      "id": "hero",
+      "race": 1,
+      "class": 1,
+      "level": 60
+    }
+  ],
+  "creatures": [
+    {
+      "id": "boss",
+      "owner": "hero",
+      "entry": 11380,
+      "level": 63,
+      "reaction": 2,
+      "distance": 4
+    }
+  ],
+  "steps": [
+    {
+      "action": "set_health",
+      "actor": "hero",
+      "value": 10000000,
+      "maximum": 10000000
+    },
+    {
+      "action": "wait",
+      "label": "Let the fixtures settle",
+      "ms": 3000
+    },
+    {
+      "action": "attack",
+      "label": "Engage Jin'do",
+      "actor": "hero",
+      "target": "boss"
+    },
+    {
+      "action": "assert",
+      "label": "Jin'do fights the hero",
+      "actor": "boss",
+      "metric": "combat",
+      "equals": 1,
+      "within_ms": 10000
+    },
+    {
+      "action": "assert",
+      "label": "Delusions of Jin'do curses the hero",
+      "actor": "hero",
+      "metric": "aura",
+      "spell": 2118512,
+      "equals": 1,
+      "within_ms": 25000
+    },
+    {
+      "action": "assert",
+      "label": "the curse's vision half also lands",
+      "actor": "hero",
+      "metric": "aura",
+      "spell": 2118511,
+      "equals": 1
+    },
+    {
+      "action": "assert",
+      "label": "CONTROL: no third Delusions debuff",
+      "actor": "hero",
+      "metric": "aura",
+      "spell": 24306,
+      "equals": 0
+    }
+  ]
+}

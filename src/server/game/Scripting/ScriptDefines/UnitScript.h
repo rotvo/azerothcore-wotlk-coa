@@ -19,6 +19,7 @@
 #define SCRIPT_OBJECT_UNIT_SCRIPT_H_
 
 #include "ScriptObject.h"
+#include <optional>
 #include <vector>
 
 enum UnitHook
@@ -46,15 +47,24 @@ enum UnitHook
     UNITHOOK_ON_UNIT_EXIT_COMBAT,
     UNITHOOK_ON_UNIT_DEATH,
     UNITHOOK_ON_UNIT_SET_SHAPESHIFT_FORM,
+    UNITHOOK_ON_BEFORE_HEAL_ABSORB,
+    UNITHOOK_ON_AFTER_AURA_EFFECT_CALCULATE_AMOUNT,
     UNITHOOK_ON_SEND_AURA_UPDATE,
     UNITHOOK_MODIFY_SPELL_EFFECT_BASE_VALUE,
     UNITHOOK_CAN_UNIT_ATTACK,
+    UNITHOOK_CAN_UNIT_ASSIST,
     UNITHOOK_SPELL_MAGNET_TARGET,
+    UNITHOOK_RESOLVE_SPELL_CAST,
+    UNITHOOK_ON_HEALTH_CHANGED,
+    UNITHOOK_MODIFY_MELEE_DAMAGE_RANGE,
+    UNITHOOK_ON_UPDATE_RUN_SPEED,
     UNITHOOK_END
 };
 
 enum ReputationRank : uint8;
 class ByteBuffer;
+class HealInfo;
+class AuraEffect;
 struct BuildValuesCachePosPointers;
 
 class UnitScript : public ScriptObject
@@ -63,8 +73,18 @@ protected:
     UnitScript(char const* name, bool addToScripts = true, std::vector<uint16> enabledHooks = std::vector<uint16>());
 
 public:
+    // Resolve metadata before Spell construction, preserving targets, flags and forwarded values.
+    virtual void ResolveSpellCast(Unit* /*caster*/, SpellInfo const*& /*spellInfo*/, AuraEffect const* /*triggeredByAura*/) { }
+
     // Called when a unit deals healing to another unit
     virtual void OnHeal(Unit* /*healer*/, Unit* /*reciever*/, uint32& /*gain*/) { }
+
+    // Runs once for direct and periodic healing, before absorbs and overhealing.
+    virtual void OnBeforeHealAbsorb(HealInfo& /*healInfo*/) { }
+
+    // Runs after spell-specific calculations and before applying aura stacks.
+    virtual void OnAfterAuraEffectCalculateAmount(AuraEffect const* /*effect*/, Unit* /*caster*/,
+        int32& /*amount*/) { }
 
     // Called when a unit deals damage to another unit
     virtual void OnDamage(Unit* /*attacker*/, Unit* /*victim*/, uint32& /*damage*/) { }
@@ -83,6 +103,13 @@ public:
     // Called when Melee Damage is being Dealt
     virtual void ModifyMeleeDamage(Unit* /*target*/, Unit* /*attacker*/, uint32& /*damage*/) { }
 
+    // Called with a melee swing's damage range before the roll
+    virtual void ModifyMeleeDamageRange(Unit* /*target*/, Unit* /*attacker*/, float& /*minDamage*/, float& /*maxDamage*/) { }
+
+    // Called with the run speed modifiers before slows are applied
+    virtual void OnUnitUpdateRunSpeed(Unit* /*unit*/, int32& /*mainSpeedMod*/, float& /*stackBonus*/,
+        float& /*nonStackBonus*/) { }
+
     // Called when Spell Damage is being Dealt
     virtual void ModifySpellDamageTaken(Unit* /*target*/, Unit* /*attacker*/, int32& /*damage*/, SpellInfo const* /*spellInfo*/) { }
 
@@ -95,7 +122,9 @@ public:
     virtual void ModifyHealReceived(Unit* /*target*/, Unit* /*healer*/, uint32& /*heal*/, SpellInfo const* /*spellInfo*/) { }
 
     //Called when Damage is Dealt
-    virtual uint32 DealDamage(Unit* /*AttackerUnit*/, Unit* /*pVictim*/, uint32 damage, DamageEffectType /*damagetype*/) { return damage; }
+    virtual uint32 DealDamage(Unit* /*AttackerUnit*/, Unit* /*pVictim*/, uint32 damage,
+                              DamageEffectType /*damagetype*/,
+                              std::optional<uint32>* /*scriptHealthLeechDamage*/) { return damage; }
 
     virtual void OnBeforeRollMeleeOutcomeAgainst(Unit const* /*attacker*/, Unit const* /*victim*/, WeaponAttackType /*attType*/, int32& /*attackerMaxSkillValueForLevel*/, int32& /*victimMaxSkillValueForLevel*/, int32& /*attackerWeaponSkill*/, int32& /*victimDefenseSkill*/, int32& /*crit_chance*/, int32& /*miss_chance*/, int32& /*dodge_chance*/, int32& /*parry_chance*/, int32& /*block_chance*/ ) {   };
 
@@ -110,6 +139,8 @@ public:
 
     [[nodiscard]] virtual bool IfNormalReaction(Unit const* /*unit*/, Unit const* /*target*/, ReputationRank& /*repRank*/) { return true; }
     [[nodiscard]] virtual bool CanUnitAttack(Unit const* /*attacker*/, Unit const* /*target*/,
+        SpellInfo const* /*spell*/) { return true; }
+    [[nodiscard]] virtual bool CanUnitAssist(Unit const* /*assister*/, Unit const* /*target*/,
         SpellInfo const* /*spell*/) { return true; }
     virtual Unit* SpellMagnetTarget(Unit* /*attacker*/, Unit* /*victim*/, SpellInfo const* /*spell*/) { return nullptr; }
 
@@ -136,6 +167,7 @@ public:
     virtual void OnUnitExitCombat(Unit* /*unit*/) { }
     virtual void OnUnitDeath(Unit* /*unit*/, Unit* /*killer*/) { }
     virtual void OnUnitSetShapeshiftForm(Unit* /*unit*/, uint8 /*form*/) { }
+    virtual void OnHealthChanged(Unit* /*unit*/) { }
 };
 
 #endif

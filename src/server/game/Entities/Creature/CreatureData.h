@@ -183,6 +183,13 @@ struct CreatureModel
 };
 
 // from `creature_template` table
+enum class QuestTargetRespawn : uint8
+{
+    None,
+    General,
+    Named
+};
+
 struct CreatureTemplate
 {
     uint32  Entry;
@@ -266,9 +273,11 @@ struct CreatureTemplate
         return (type_flags & CREATURE_TYPE_FLAG_TAMEABLE_EXOTIC) != 0;
     }
 
+    // Ascension tames undead, demons, elementals and dragonkin too; each taming spell names the creature type it
+    // takes in its TargetCreatureType, so the creature's own type is not tested here.
     [[nodiscard]] bool IsTameable(bool exotic) const
     {
-        if (type != CREATURE_TYPE_BEAST || family == 0 || (type_flags & CREATURE_TYPE_FLAG_TAMEABLE) == 0)
+        if (family == 0 || (type_flags & CREATURE_TYPE_FLAG_TAMEABLE) == 0)
             return false;
 
         // if can tame exotic then can tame any tameable
@@ -395,7 +404,7 @@ struct CreatureModelInfo
 };
 
 // Benchmarked: Faster than std::map (insert/find)
-typedef std::unordered_map<uint16, CreatureModelInfo> CreatureModelContainer;
+typedef std::unordered_map<uint32, CreatureModelInfo> CreatureModelContainer;
 
 enum InhabitTypeValues
 {

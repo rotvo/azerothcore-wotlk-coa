@@ -38,7 +38,9 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <utility>
+#include <vector>
 
 class Creature;
 class GameObject;
@@ -452,6 +454,7 @@ public:
 
     void ReadAddonsInfo(ByteBuffer& data);
     void SendAddonsInfo();
+    std::vector<std::string> const& GetClientAddonNames() const { return m_clientAddonNames; }
 
     void ReadMovementInfo(WorldPacket& data, MovementInfo* mi);
     void WriteMovementInfo(WorldPacket* data, MovementInfo* mi);
@@ -515,9 +518,16 @@ public:
     std::string const& GetRemoteAddress() { return m_Address; }
 
     // Set by WorldSocket: the connection uses the Ascension client protocol
-    // (loopback or AscensionCompat.AllowRemoteClients, and AscensionCompat.Enable).
+    // (loopback or CoA.AllowRemoteClients, and CoA.Enable).
     bool IsAscensionCompatEnabled() const { return _ascensionCompatEnabled; }
     void SetAscensionCompatEnabled(bool enabled) { _ascensionCompatEnabled = enabled; }
+    // The client behind this connection holds the streamed spell visual and sound rows.
+    bool HasAscensionSpellVisualRows() const { return _ascensionSpellVisualRows; }
+    void SetAscensionSpellVisualRows() { _ascensionSpellVisualRows = true; }
+    // The character whose display patch rows this connection's client received (0: none). A reconnect to a
+    // character still in the world gets a new session, so its client is streamed again.
+    uint32 GetAscensionPatchStreamGuid() const { return _ascensionPatchStreamGuid; }
+    void SetAscensionPatchStreamGuid(uint32 guid) { _ascensionPatchStreamGuid = guid; }
     void SetPlayer(Player* player);
     uint8 Expansion() const { return m_expansion; }
 
@@ -578,8 +588,11 @@ public:
 
     //void SendTestCreatureQueryOpcode(uint32 entry, ObjectGuid guid, uint32 testvalue);
     void SendNameQueryOpcode(ObjectGuid guid);
+    void SendItemQuerySingleResponse(uint32 item);
 
-    void SendTrainerList(Creature* npc);
+    /// `onlyTrainable` leaves out the rows of the window the player cannot buy yet; see
+    /// Trainer::SendSpells.
+    void SendTrainerList(Creature* npc, bool onlyTrainable = false);
     void SendListInventory(ObjectGuid guid, uint32 vendorEntry = 0);
     void SendShowBank(ObjectGuid guid);
     bool CanOpenMailBox(ObjectGuid guid);
@@ -685,6 +698,19 @@ public:
     // Recruit-A-Friend Handling
     uint32 GetRecruiterId() const { return recruiterId; }
     bool IsARecruiter() const { return isRecruiter; }
+    bool InviteRecruitAFriend(Player* target);
+    bool HandleRecruitAFriendInviteResponse(uint32 menuId, uint32 action);
+    void RefreshRecruitAFriendFlags();
+    SpellCastResult CheckRecruitAFriendSummon(Player const* target) const;
+    void SetRecruitAFriendSummoner(ObjectGuid guid) { _rafSummoner = guid; }
+    bool ValidateRecruitAFriendSummon(ObjectGuid guid, bool agree);
+    void ClearRecruitAFriendRequests();
+    void UpdateRecruitAFriendRewards(bool force = false);
+    bool RecordRecoveryItem(Item* item, uint32 count = 0);
+    bool HandleRecruitAFriendRewardsCommand(std::string const& command);
+    void UpdateRecruitMilestoneRewards();
+    void RecoverRecruitAFriendRewards(bool recruit = false);
+    void DeliverRecruitAFriendRewards(PreparedQueryResult rows, bool recruit);
 
     // Packets cooldown
     time_t GetCalendarEventCreationCooldown() const { return _calendarEventCreationCooldown; }
@@ -884,6 +910,7 @@ public:                                                 // opcodes handlers
     void HandleTaxiQueryAvailableNodes(WorldPacket& recvPacket);
     void HandleActivateTaxiOpcode(WorldPacket& recvPacket);
     void HandleActivateTaxiExpressOpcode(WorldPacket& recvPacket);
+    void HandleTaxiRequestEarlyLandingOpcode(WorldPacket& recvPacket);
     void HandleMoveSplineDoneOpcode(WorldPacket& recvPacket);
     void SendActivateTaxiReply(ActivateTaxiReply reply);
 
@@ -899,6 +926,7 @@ public:                                                 // opcodes handlers
     void HandleListStabledPetsOpcode(WorldPacket& recvPacket);
     void HandleStablePet(WorldPacket& recvPacket);
     void HandleUnstablePet(WorldPacket& recvPacket);
+    void HandleStableDeletePet(WorldPacket& recvPacket);
     void HandleBuyStableSlot(WorldPacket& recvPacket);
     void HandleStableRevivePet(WorldPacket& recvPacket);
     void HandleStableSwapPet(WorldPacket& recvPacket);
@@ -991,6 +1019,7 @@ public:                                                 // opcodes handlers
     void HandleQuestgiverCancel(WorldPacket& recvData);
     void HandleQuestLogSwapQuest(WorldPackets::Quest::QuestLogSwapQuest& packet);
     void HandleQuestLogRemoveQuest(WorldPackets::Quest::QuestLogRemoveQuest& packet);
+    void AbandonQuestLogSlot(uint16 slot);
     void HandleQuestConfirmAccept(WorldPackets::Quest::QuestConfirmAcceptClient& packet);
     void HandleQuestgiverCompleteQuest(WorldPacket& recvData);
     void HandleQuestgiverQuestAutoLaunch(WorldPackets::Quest::QuestGiverQuestAutoLaunch& packet);
@@ -1091,6 +1120,9 @@ public:                                                 // opcodes handlers
     void HandleResetInstancesOpcode(WorldPackets::Instance::ResetInstances& packet);
     void HandleResetDungeonsOpcode(WorldPacket& recvData);
     void ResetAllDungeons();
+    void HandlePortGraveyardOpcode(WorldPacket& recvData);
+    void HandleQueryInstanceBindsOpcode(WorldPacket& recvData);
+    void HandleResetInstanceOpcode(WorldPacket& recvData);
     void HandleHearthAndResurrect(WorldPacket& recvData);
     void HandleInstanceLockResponse(WorldPackets::Instance::InstanceLockResponse& packet);
     void HandleUpdateMissileTrajectory(WorldPacket& recvPacket);
@@ -1238,8 +1270,18 @@ public:                                                 // opcodes handlers
      */
 
     QueryCallbackProcessor& GetQueryProcessor() { return _queryProcessor; }
+    void QueueQueryCallback(QueryCallback&& callback);
     TransactionCallback& AddTransactionCallback(TransactionCallback&& callback);
     SQLQueryHolderCallback& AddQueryHolderCallback(SQLQueryHolderCallback&& callback);
+
+    [[nodiscard]] bool HasPendingAsyncCallbacks() const
+    {
+        std::lock_guard lock(_queuedQueryCallbacksMutex);
+        if (!_queuedQueryCallbacks.empty())
+            return true;
+
+        return !_queryProcessor.Empty() || !_transactionCallbacks.Empty() || !_queryHolderProcessor.Empty();
+    }
 
     void InitializeSession();
     void InitializeSessionCallback(CharacterDatabaseQueryHolder const& realmHolder, uint32 clientCacheVersion);
@@ -1253,10 +1295,17 @@ public:                                                 // opcodes handlers
         return _isBot;
     }
 
+    [[nodiscard]] bool IsHeadlessBot() const
+    {
+        return _isBot && !m_Socket && !_socketlessPacketObserver;
+    }
+
 private:
     void ProcessQueryCallbacks();
 
     QueryCallbackProcessor _queryProcessor;
+    mutable std::mutex _queuedQueryCallbacksMutex;
+    std::vector<QueryCallback> _queuedQueryCallbacks;
     AsyncCallbackProcessor<TransactionCallback> _transactionCallbacks;
     AsyncCallbackProcessor<SQLQueryHolderCallback> _queryHolderProcessor;
 
@@ -1295,8 +1344,6 @@ private:
 
     bool CanUseBank(ObjectGuid bankerGUID = ObjectGuid::Empty) const;
 
-    bool recoveryItem(Item* pItem);
-
     // logging helper
     void LogUnexpectedOpcode(WorldPacket* packet, char const* status, char const* reason);
     void LogUnprocessedTail(WorldPacket* packet);
@@ -1317,6 +1364,8 @@ private:
     std::function<void(WorldPacket const&)> _socketlessPacketObserver;
     std::string m_Address;
     bool _ascensionCompatEnabled = false;
+    bool _ascensionSpellVisualRows = false;
+    uint32 _ascensionPatchStreamGuid = 0;
 
     AccountTypes _security;
     bool _skipQueue;
@@ -1348,8 +1397,20 @@ private:
     uint32 m_Tutorials[MAX_ACCOUNT_TUTORIAL_VALUES];
     bool   m_TutorialsChanged;
     AddonsList m_addonsList;
+    std::vector<std::string> m_clientAddonNames;
     uint32 recruiterId;
     bool isRecruiter;
+    ObjectGuid _rafGrantFrom;
+    ObjectGuid _rafGrantRecipient;
+    uint8 _rafGrantLevel = 0;
+    uint8 _rafGrantDonorLevel = 0;
+    time_t _rafGrantExpiry = 0;
+    ObjectGuid _rafInviter;
+    time_t _rafInviteExpiry = 0;
+    time_t _rafInviteCooldown = 0;
+    time_t _rafRewardsNextUpdate = 0;
+    uint64 _rafRewardSession = 0;
+    ObjectGuid _rafSummoner;
     LockedQueue<WorldPacket*> _recvQueue;
     std::atomic<uint64> _scriptPacketToken{0};
     uint32 m_currentVendorEntry;

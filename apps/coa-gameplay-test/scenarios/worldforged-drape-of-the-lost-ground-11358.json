@@ -1,0 +1,122 @@
+{
+  "schema": 1,
+  "name": "Worldforged Drape of the Lost stands on the Azshara stone table, not under the hillside (#11358, #11996)",
+  "contract": "#11358 reported the Drape of the Lost pickup (gameobject entry 254410, guid 6941650) missing at the Azshara graveyard; rev_20261106_232 then lowered it to the first surface the server finds below its old x/y (2698.7, -4029.9), which are tree roots 8.35 yd under the hillside, and #11996 reported it under the tree trunk. rev_20261124_11996 restores the realm object's recorded x/y (first-pass row 6900180) on top of the Elvenstonetable01 stone table at z 109.722: no model surface lies above it, it rests on the table and the chest opens.",
+  "timeout_ms": 60000,
+  "location": {
+    "map": 1,
+    "x": 2690.5,
+    "y": -4013.5,
+    "z": 108.9,
+    "o": 0
+  },
+  "players": [
+    {
+      "id": "p",
+      "race": 1,
+      "class": 12,
+      "level": 60
+    }
+  ],
+  "steps": [
+    {
+      "action": "set_phase",
+      "actor": "p",
+      "value": 1
+    },
+    {
+      "action": "wait",
+      "ms": 3000
+    },
+    {
+      "action": "assert",
+      "label": "SETUP: the pickup is in the area",
+      "actor": "p",
+      "metric": "nearby_gameobject_count",
+      "entry": 254410,
+      "equals": 1
+    },
+    {
+      "action": "assert",
+      "label": "DISCRIMINATING: the pickup stands at the recorded realm spot, not 16.7 yd away under the hillside",
+      "actor": "p",
+      "metric": "spawn_distance",
+      "x": 2692.86,
+      "y": -4015.19,
+      "z": 109.722,
+      "max": 0.5,
+      "guid": 6941650,
+      "spawn_type": "gameobject"
+    },
+    {
+      "action": "assert",
+      "label": "DISCRIMINATING: no model or terrain surface lies above the pickup",
+      "actor": "p",
+      "metric": "spawn_headroom",
+      "min": 5,
+      "guid": 6941650,
+      "spawn_type": "gameobject"
+    },
+    {
+      "action": "snapshot",
+      "label": "clearance after the fix",
+      "actor": "p",
+      "metric": "spawn_clearance",
+      "guid": 6941650,
+      "spawn_type": "gameobject",
+      "save_as": "clearance"
+    },
+    {
+      "action": "assert",
+      "label": "the pickup rests on the stone table",
+      "actor": "p",
+      "metric": "spawn_ground_gap",
+      "guid": 6941650,
+      "spawn_type": "gameobject",
+      "min": -0.3,
+      "max": 0.5
+    },
+    {
+      "action": "assert",
+      "label": "the pickup is grounded within 0.8 yd",
+      "actor": "p",
+      "metric": "spawn_placement",
+      "guid": 6941650,
+      "spawn_type": "gameobject",
+      "tolerance": 0.8,
+      "equals": 0
+    },
+    {
+      "action": "set_aura",
+      "actor": "p",
+      "spell": 642,
+      "stacks": 1
+    },
+    {
+      "action": "cast",
+      "actor": "p",
+      "spell": 3365,
+      "target_gameobject": 254410
+    },
+    {
+      "action": "wait",
+      "ms": 5500
+    },
+    {
+      "action": "assert",
+      "label": "the pickup is within reach and opens",
+      "actor": "p",
+      "metric": "cast_failure",
+      "spell": 3365,
+      "equals": 0
+    },
+    {
+      "action": "assert",
+      "label": "its loot is shown",
+      "actor": "p",
+      "metric": "loot_count",
+      "min": 1,
+      "within_ms": 3000
+    }
+  ]
+}

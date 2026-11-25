@@ -1,0 +1,773 @@
+/*
+ * High Priestess Mar'li with Ascension's spells.
+ *
+ * Kit: Ascension's block 2118100-2118151. Timings: a Bronzebeard kill on video,
+ * see raid-difficulty-werkzeug/zg-video-zeitplan.json. Stock swaps between
+ * troll and spider every minute; on Ascension she stays a troll until 50% and
+ * a spider after (in the video from 49%, 230s in). The spider form's cycle
+ * (Web Spray, Burrow, Poison Shock every 45s) and Fierce Blow follow the CoA
+ * combat log of 2026-08-02; on Mythic and Ascended the cycle is 58s (the CoA
+ * Mythic log of 2026-08-04: 58.5s; Bronzebeard Ascended, 2025-12-21: 56-58s).
+ *
+ *   Both forms
+ *     Poison Bolt Volley first 12s, every 15s   everyone, stacking poison
+ *     Hatch Eggs         first 17s, every 30s   the ten eggs nearest the players
+ *                                               cast Hatching (10s), one spider
+ *                                               from each egg that finishes; a
+ *                                               killed egg hatches nothing (a DBM
+ *                                               bar in the live video of
+ *                                               2026-08-04; count and delay:
+ *                                               tester, live, 2026-11-04; killed
+ *                                               eggs: the live logs of 2026-08-04
+ *                                               and 2025-12-21)
+ *     Fierce Blow        tank, first 6.7-17.3s, then every 6-10s
+ *
+ *   Troll form
+ *     Drain Life         first 6s,  every 10s   random player, interruptible
+ *     Evolve             first 22s, every 60s   cast on an egg: it swells and
+ *                                               hatches a colossal spider;
+ *                                               Mythic and Ascended only (tester,
+ *                                               round 5)
+ *
+ *   At 50% she drains the Avatar of Shadra (see LoaAvatar), taking ~1% damage
+ *   while it dies; then the Gift of the Blood God and her spider form.
+ *
+ *   Spider form, when the avatar dies
+ *     Acid Spit          first 1s,  every 12s   on the tank, poison and -10% armour
+ *     Web Spray          first 15s, every cycle everyone within 35 yards (the
+ *                                               spell's own 20 widened: tester,
+ *                                               2026-11-08) is slowed, then
+ *                                               webbed; then she charges a
+ *                                               caster, as in stock
+ *     Burrow             first 20.5s, every cycle under ground for 3s, untargetable
+ *                                               and hidden (the Hide Body display
+ *                                               of Burrow's misc value 24417, as
+ *                                               Kurinnaxx's Tunneling);
+ *                                               she comes up where the player
+ *                                               farthest from her stands (tester,
+ *                                               2026-11-12) and stays on
+ *                                               them for 8s, untauntable (tester,
+ *                                               live, 2026-11-04); on Mythic and
+ *                                               Ascended for 21s, through Poison
+ *                                               Shock and about 15s of melee (the
+ *                                               Mythic log: 12-19s on non-tanks)
+ *     Poison Shock       1.8s after she comes up (both logs), Poison Nova,
+ *                                               20 yards around her, less the
+ *                                               farther away
+ *     Infest             first 15s, every 60s   Ascended only: an egg hatches a
+ *                                               festering spider that carries
+ *                                               Putrid Cloud and leaves a
+ *                                               Festering Cloud where it dies
+ *                                               (the Ascended log of 2025-12-21)
+ *     Furious Strikes    passive, her hits speed her up
+ *
+ * The eggs are Spider Egg creatures (14915, the live client cache), each
+ * casting Hatching (2118119, 10s) when she calls on it.
+ *
+ * Decided here, not in the data:
+ *   - Infest acts on an egg she hatches for it at once (live, its egg hatches
+ *     about 15s later);
+ *   - an evolved egg starts Hatching when Evolve lands, and the spawn it hatches
+ *     takes Evolve itself (three times the size, twice the health) and never
+ *     grows (live, 2026-08-04: the egg hatched 10.2s after Evolve, a spider
+ *     without Growth);
+ *   - a hatched or killed egg comes back 30s later, the Hatch Eggs interval: no
+ *     source shows how the arena fills again (round-7 tester, 2026-11-14: the
+ *     eggs ran out);
+ *   - the festering spawn is a Spawn of Mar'li (15041), estimated: the live
+ *     Festering Spawn of Mar'li has no creature data in any source;
+ *   - Drain Life heals her for what each tick deals;
+ *   - Poison Nova falls off evenly to nothing at 20 yards (the tooltip says
+ *     reduced, not by how much);
+ *   - her hunted player carries Menacing Gaze from the kit while she is fixed
+ *     on them (no combat log shows it).
+ */
+
+#include "Containers.h"
+#include "CreatureScript.h"
+#include "ScriptedCreature.h"
+#include "Spell.h"
+#include "../../../src/server/scripts/EasternKingdoms/ZulGurub/zulgurub.h"
+#include "zg_coa_common.h"
+#include "zg_coa_leash.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <limits>
+#include <list>
+#include <vector>
+
+using namespace coa_zg;
+
+namespace
+{
+    enum Says
+    {
+        SAY_AGGRO        = 0,
+        SAY_TRANSFORM    = 1,
+        SAY_SPIDER_SPAWN = 2,
+        SAY_DEATH        = 3
+    };
+
+    enum Spells
+    {
+        SPELL_THRASH              = 3391,
+        SPELL_CHARGE              = 22911,
+
+        INFO_DRAIN_LIFE           = 2118101,
+        SPELL_DRAIN_LIFE          = 2118105,
+        SPELL_DRAIN_LIFE_SPLASH   = 2118106,
+        SPELL_DRAIN_LIFE_TICK     = 2118107,
+        SPELL_DRAIN_LIFE_HEAL     = 2118108,
+        SPELL_POISON_BOLT_VOLLEY  = 2118109,
+        SPELL_POISON_BOLT_HIT     = 2118110,
+        SPELL_HATCH_EGGS          = 2118115,
+        SPELL_EVOLVE              = 2118116,
+        SPELL_DRAIN_POWER         = 2118122,
+        SPELL_ASPECT_OF_SHADRA    = 2118123,
+        SPELL_GIFT_OF_THE_BLOOD_GOD = 2118124,
+        SPELL_FURIOUS_STRIKES     = 2118125,
+        SPELL_ACID_SPIT           = 2118127,
+        SPELL_ACID_SPIT_DOT       = 2118128,
+        SPELL_CORROSION           = 2118132,
+        SPELL_WEB_SPRAY           = 2118133,
+        SPELL_POISON_SHOCK        = 2118145,
+        SPELL_POISON_SHOCK_HIT    = 2118146,
+        SPELL_BURROW              = 2118140,
+        SPELL_MENACING_GAZE       = 2118141,
+        SPELL_POISON_NOVA         = 2118150,
+        SPELL_INFEST              = 2118151,
+        SPELL_PUTRID_CLOUD        = 2118170,
+        SPELL_FESTERING_CLOUD     = 2118176,
+    };
+
+    enum Misc
+    {
+        NPC_SPIDER_EGG     = 14915,
+        NPC_SPAWN_OF_MARLI = 15041,
+        NPC_AVATAR_OF_SHADRA = 666990,
+        SPELL_HATCHING     = 2118119,
+    };
+
+    enum EggData
+    {
+        DATA_HATCH_FOR_MARLI = 1,
+        DATA_EGG_HATCHED,
+        DATA_EGG_DIED,
+    };
+
+    enum Events
+    {
+        EVENT_THRASH = 1,
+        EVENT_DRAIN_LIFE,
+        EVENT_POISON_BOLT_VOLLEY,
+        EVENT_HATCH_EGGS,
+        EVENT_EVOLVE,
+        EVENT_INFEST,
+        EVENT_ACID_SPIT,
+        EVENT_WEB_SPRAY,
+        EVENT_CHARGE,
+        EVENT_POISON_SHOCK,
+        EVENT_BURROW,
+        EVENT_EMERGE,
+        EVENT_END_HUNT,
+        EVENT_FIERCE_BLOW,
+    };
+
+    enum Phases
+    {
+        PHASE_TROLL  = 1,
+        PHASE_SPIDER = 2
+    };
+
+    constexpr float VOLLEY_RANGE   = 200.0f;
+    constexpr uint8 EGGS_PER_HATCH = 10;
+    constexpr float NOVA_RANGE     = 20.0f;
+    constexpr float WEB_SPRAY_RANGE = 35.0f;
+    constexpr uint32 DISPLAY_HIDE_BODY = 22452;
+    constexpr Milliseconds BURROW_LENGTH        = 3s;
+    constexpr Milliseconds HUNT_LENGTH          = 8s;
+    constexpr Milliseconds HUNT_LENGTH_MYTHIC   = 21s;
+    constexpr Milliseconds SPIDER_CYCLE         = 45s;
+    constexpr Milliseconds SPIDER_CYCLE_MYTHIC  = 58s;
+    constexpr Milliseconds POISON_SHOCK_AFTER_EMERGE = 1800ms;
+    constexpr Milliseconds HATCH_EVERY          = 30s;
+    constexpr Seconds EGG_REFILL                = 30s;
+    constexpr std::array<Mechanics, 19> CROWD_CONTROL_MECHANICS = {
+        MECHANIC_CHARM, MECHANIC_DISORIENTED, MECHANIC_DISTRACT, MECHANIC_FEAR, MECHANIC_GRIP, MECHANIC_ROOT,
+        MECHANIC_SILENCE, MECHANIC_SLEEP, MECHANIC_SNARE, MECHANIC_STUN, MECHANIC_FREEZE, MECHANIC_KNOCKOUT,
+        MECHANIC_POLYMORPH, MECHANIC_BANISH, MECHANIC_SHACKLE, MECHANIC_TURN, MECHANIC_HORROR, MECHANIC_DAZE,
+        MECHANIC_SAPPED };
+    constexpr float EGG_SEARCH_RANGE = 100.0f;
+    constexpr float DRAIN_LIFE_RANGE = 100.0f;
+    constexpr float DRAIN_LIFE_SPLASH_SHARE = 0.32f;
+    constexpr uint8 MYTHIC_SPAWN_MODE = 2;
+    constexpr uint8 INFEST_MIN_SPAWN_MODE = 3;
+    constexpr float HUNT_THREAT    = 1000000.0f;
+
+    struct boss_marli_coa : public BossAI
+    {
+        boss_marli_coa(Creature* creature) : BossAI(creature, DATA_MARLI)
+        {
+            SetBoundary(coa_zg::LeashFor(DATA_MARLI));
+        }
+
+        void Reset() override
+        {
+            me->RemoveAurasDueToSpell(SPELL_ASPECT_OF_SHADRA);
+            me->RemoveAurasDueToSpell(SPELL_FURIOUS_STRIKES);
+            me->RemoveAurasDueToSpell(SPELL_GIFT_OF_THE_BLOOD_GOD);
+            _avatar.Restore(me);
+            _spider = false;
+            _festering.clear();
+            _evolvedEgg.Clear();
+            StopEggs(true);
+            EndDrainLifeSplash();
+            EndHunt();
+            Emerge();
+            BossAI::Reset();
+        }
+
+        void JustEngagedWith(Unit* who) override
+        {
+            BossAI::JustEngagedWith(who);
+            Talk(SAY_AGGRO);
+            _avatar.Restore(me);
+
+            events.SetPhase(PHASE_TROLL);
+            events.ScheduleEvent(EVENT_THRASH, 4s, 6s);
+            events.ScheduleEvent(EVENT_DRAIN_LIFE, 6s, 0, PHASE_TROLL);
+            events.ScheduleEvent(EVENT_POISON_BOLT_VOLLEY, 12s);
+            events.ScheduleEvent(EVENT_HATCH_EGGS, 17s);
+            if (MythicOrHigher())
+                events.ScheduleEvent(EVENT_EVOLVE, 22s, 0, PHASE_TROLL);
+            events.ScheduleEvent(EVENT_FIERCE_BLOW, FIERCE_BLOW_FIRST_MIN, FIERCE_BLOW_FIRST_MAX);
+        }
+
+        void JustDied(Unit* killer) override
+        {
+            StopEggs(false);
+            EndDrainLifeSplash();
+            EndHunt();
+            BossAI::JustDied(killer);
+            _avatar.Release(me);
+            Talk(SAY_DEATH);
+        }
+
+        void DamageTaken(Unit* attacker, uint32& damage, DamageEffectType type, SpellSchoolMask school) override
+        {
+            BossAI::DamageTaken(attacker, damage, type, school);
+
+            if (_spider || !me->HealthBelowPctDamaged(50, damage))
+                return;
+
+            _spider = true;
+            if (!_avatar.Drain(me))
+                TakeSpiderForm();
+        }
+
+        void TakeSpiderForm()
+        {
+            me->InterruptNonMeleeSpells(false);
+            Talk(SAY_TRANSFORM);
+            DoCastSelf(SPELL_GIFT_OF_THE_BLOOD_GOD, true);
+            DoCastSelf(SPELL_ASPECT_OF_SHADRA, true);
+            DoCastSelf(SPELL_FURIOUS_STRIKES, true);
+
+            events.SetPhase(PHASE_SPIDER);
+            events.ScheduleEvent(EVENT_ACID_SPIT, 1s, 0, PHASE_SPIDER);
+            events.ScheduleEvent(EVENT_WEB_SPRAY, 15s, 0, PHASE_SPIDER);
+            events.ScheduleEvent(EVENT_BURROW, 20500ms, 0, PHASE_SPIDER);
+            if (me->GetMap()->GetSpawnMode() >= INFEST_MIN_SPAWN_MODE)
+                events.ScheduleEvent(EVENT_INFEST, 15s, 0, PHASE_SPIDER);
+        }
+
+        bool MythicOrHigher() const
+        {
+            return me->GetMap()->GetSpawnMode() >= MYTHIC_SPAWN_MODE;
+        }
+
+        Milliseconds SpiderCycle() const
+        {
+            return MythicOrHigher() ? SPIDER_CYCLE_MYTHIC : SPIDER_CYCLE;
+        }
+
+        void OnSpellCast(SpellInfo const* spell) override
+        {
+            BossAI::OnSpellCast(spell);
+
+            switch (spell->Id)
+            {
+                case SPELL_POISON_BOLT_VOLLEY:
+                    for (Player* p : PlayersWithin(me, VOLLEY_RANGE))
+                        me->CastSpell(p, SPELL_POISON_BOLT_HIT, true);
+                    break;
+                case SPELL_DRAIN_LIFE:
+                    DrainLifeSplash();
+                    break;
+                case SPELL_HATCH_EGGS:
+                    Talk(SAY_SPIDER_SPAWN);
+                    ClaimEggsNearPlayers();
+                    break;
+                case SPELL_ACID_SPIT:
+                    if (Unit* tank = me->GetVictim())
+                    {
+                        me->CastSpell(tank, SPELL_ACID_SPIT_DOT, true);
+                        me->CastSpell(tank, SPELL_CORROSION, true);
+                    }
+                    break;
+                case SPELL_POISON_SHOCK:
+                {
+                    int32 const full = Info(me, SPELL_POISON_SHOCK_HIT);
+                    for (Player* p : PlayersWithin(me, NOVA_RANGE))
+                        Hit(me, p, SPELL_POISON_NOVA, int32(full * (1.0f - me->GetDistance(p) / NOVA_RANGE)));
+                    break;
+                }
+                case SPELL_WEB_SPRAY:
+                    for (Player* p : PlayersWithin(me, WEB_SPRAY_RANGE))
+                        if (!p->HasAura(SPELL_WEB_SPRAY, me->GetGUID()) && me->IsWithinLOSInMap(p))
+                            me->AddAura(SPELL_WEB_SPRAY, p);
+                    break;
+                case SPELL_BURROW:
+                    me->AttackStop();
+                    me->SetReactState(REACT_PASSIVE);
+                    me->SetUnitFlag(UNIT_FLAG_NOT_SELECTABLE | UNIT_FLAG_NON_ATTACKABLE);
+                    me->SetDisplayId(DISPLAY_HIDE_BODY);
+                    events.ScheduleEvent(EVENT_EMERGE, BURROW_LENGTH, 0, PHASE_SPIDER);
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        void SpellHitTarget(Unit* target, SpellInfo const* spell) override
+        {
+            switch (spell->Id)
+            {
+                case SPELL_EVOLVE:
+                    if (target->GetEntry() == NPC_SPIDER_EGG)
+                    {
+                        OrderHatching(target->ToCreature());
+                        break;
+                    }
+                    target->SetMaxHealth(target->GetMaxHealth() * 2);
+                    target->SetFullHealth();
+                    break;
+                case SPELL_INFEST:
+                    _festering.insert(target->GetGUID());
+                    target->CastSpell(target, SPELL_PUTRID_CLOUD, true);
+                    break;
+                // Drain Life heals her for what each tick deals.
+                case SPELL_DRAIN_LIFE_TICK:
+                {
+                    int32 heal = Info(me, INFO_DRAIN_LIFE);
+                    me->CastCustomSpell(me, SPELL_DRAIN_LIFE_HEAL, &heal, nullptr, nullptr, true);
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+
+        // A festering spawn bursts into a Festering Cloud where it dies.
+        void SummonedCreatureDies(Creature* summon, Unit* killer) override
+        {
+            BossAI::SummonedCreatureDies(summon, killer);
+            if (!_festering.erase(summon->GetGUID()))
+                return;
+            me->CastSpell(summon->GetPositionX(), summon->GetPositionY(), summon->GetPositionZ(),
+                SPELL_FESTERING_CLOUD, true);
+        }
+
+        void OnChannelFinished(SpellInfo const* spell) override
+        {
+            if (spell->Id == SPELL_DRAIN_LIFE)
+                _drainSplashed.clear();
+        }
+
+        void DrainLifeSplash()
+        {
+            std::vector<Player*> raid = PlayersWithin(me, DRAIN_LIFE_RANGE);
+            size_t const count = size_t(std::lround(raid.size() * DRAIN_LIFE_SPLASH_SHARE));
+            std::erase_if(raid, [this](Player const* p) { return p->GetGUID() == _drainTarget; });
+            Acore::Containers::RandomShuffle(raid);
+            raid.resize(std::min(raid.size(), count));
+            for (Player* p : raid)
+            {
+                me->CastCustomSpell(p, SPELL_DRAIN_LIFE_SPLASH, nullptr, &_drainTick, nullptr, true);
+                _drainSplashed.push_back(p->GetGUID());
+            }
+        }
+
+        bool DrainingLife() const
+        {
+            Spell const* channel = me->GetCurrentSpell(CURRENT_CHANNELED_SPELL);
+            return channel && channel->GetSpellInfo()->Id == SPELL_DRAIN_LIFE;
+        }
+
+        void EndDrainLifeSplash()
+        {
+            for (ObjectGuid const& guid : _drainSplashed)
+                if (Player* p = ObjectAccessor::GetPlayer(*me, guid))
+                    p->RemoveAurasDueToSpell(SPELL_DRAIN_LIFE_SPLASH, me->GetGUID());
+            _drainSplashed.clear();
+        }
+
+        void KilledUnit(Unit* victim) override
+        {
+            if (victim->GetGUID() == _hunted)
+            {
+                events.CancelEvent(EVENT_END_HUNT);
+                EndHunt();
+            }
+        }
+
+        void Emerge()
+        {
+            me->RemoveAurasDueToSpell(SPELL_BURROW);
+            if (me->GetDisplayId() == DISPLAY_HIDE_BODY)
+                me->RestoreDisplayId();
+            me->RemoveUnitFlag(UNIT_FLAG_NOT_SELECTABLE | UNIT_FLAG_NON_ATTACKABLE);
+            me->SetReactState(REACT_AGGRESSIVE);
+        }
+
+        void EmergeAtFarthest()
+        {
+            Unit* prey = SelectTarget(SelectTargetMethod::MaxDistance, 0, 0.0f, true);
+            if (prey)
+                me->NearTeleportTo(prey->GetPositionX(), prey->GetPositionY(), prey->GetPositionZ(),
+                    me->GetAngle(prey));
+            Emerge();
+            if (prey)
+                Hunt(prey);
+        }
+
+        void Hunt(Unit* prey)
+        {
+            _hunted = prey->GetGUID();
+            _huntThreat = HighestThreat() * 2.0f + HUNT_THREAT;
+            me->AddAura(SPELL_MENACING_GAZE, prey);
+            me->GetThreatMgr().AddThreat(prey, _huntThreat, nullptr, true, true);
+            me->ApplySpellImmune(0, IMMUNITY_EFFECT, SPELL_EFFECT_ATTACK_ME, true);
+            me->ApplySpellImmune(0, IMMUNITY_STATE, SPELL_AURA_MOD_TAUNT, true);
+            AttackStart(prey);
+            events.ScheduleEvent(EVENT_END_HUNT, MythicOrHigher() ? HUNT_LENGTH_MYTHIC : HUNT_LENGTH, 0, PHASE_SPIDER);
+        }
+
+        void EndHunt()
+        {
+            me->ApplySpellImmune(0, IMMUNITY_EFFECT, SPELL_EFFECT_ATTACK_ME, false);
+            me->ApplySpellImmune(0, IMMUNITY_STATE, SPELL_AURA_MOD_TAUNT, false);
+            if (Unit* prey = ObjectAccessor::GetUnit(*me, _hunted))
+            {
+                prey->RemoveAurasDueToSpell(SPELL_MENACING_GAZE, me->GetGUID());
+                if (_huntThreat > 0.0f && me->GetThreatMgr().GetThreat(prey) >= _huntThreat)
+                    me->GetThreatMgr().AddThreat(prey, -_huntThreat, nullptr, true, true);
+            }
+            _hunted.Clear();
+            _huntThreat = 0.0f;
+        }
+
+        float HighestThreat() const
+        {
+            float highest = 0.0f;
+            for (ThreatReference const* ref : me->GetThreatMgr().GetUnsortedThreatList())
+                highest = std::max(highest, ref->GetThreat());
+            return highest;
+        }
+
+        void SetGUID(ObjectGuid const& guid, int32 id) override
+        {
+            if (id == DATA_EGG_DIED && guid == _evolvedEgg)
+                _evolvedEgg.Clear();
+            if (id != DATA_EGG_HATCHED || !me->IsAlive())
+                return;
+            if (Creature* egg = ObjectAccessor::GetCreature(*me, guid))
+                if (egg->IsAlive())
+                    HatchEgg(egg);
+        }
+
+        // Her eggs stop hatching with her; at a reset the arena is whole again.
+        void StopEggs(bool restore)
+        {
+            std::list<Creature*> eggs;
+            me->GetCreatureListWithEntryInGrid(eggs, NPC_SPIDER_EGG, DEFAULT_VISIBILITY_INSTANCE);
+            for (Creature* egg : eggs)
+            {
+                if (egg->IsAlive())
+                {
+                    egg->InterruptNonMeleeSpells(false);
+                    egg->RemoveAurasDueToSpell(SPELL_EVOLVE);
+                }
+                else if (restore && !egg->IsSummon())
+                    egg->Respawn(true);
+            }
+        }
+
+        std::vector<Creature*> FreeEggs()
+        {
+            std::list<Creature*> eggs;
+            me->GetCreatureListWithEntryInGrid(eggs, NPC_SPIDER_EGG, EGG_SEARCH_RANGE);
+            std::vector<Creature*> free;
+            for (Creature* egg : eggs)
+                if (egg->IsAlive() && !egg->HasUnitState(UNIT_STATE_CASTING) && !egg->HasAura(SPELL_EVOLVE) &&
+                    egg->GetGUID() != _evolvedEgg)
+                    free.push_back(egg);
+            return free;
+        }
+
+        Creature* NearestFreeEgg()
+        {
+            Creature* nearest = nullptr;
+            for (Creature* egg : FreeEggs())
+                if (!nearest || me->GetDistance(egg) < me->GetDistance(nearest))
+                    nearest = egg;
+            return nearest;
+        }
+
+        void OrderHatching(Creature* egg)
+        {
+            if (egg && egg->IsAlive() && egg->AI())
+                egg->AI()->SetGUID(me->GetGUID(), DATA_HATCH_FOR_MARLI);
+        }
+
+        // Hatch Eggs wakes the eggs nearest the raid; each that finishes Hatching hatches one spider.
+        void ClaimEggsNearPlayers()
+        {
+            std::vector<Player*> const players = PlayersWithin(me, EGG_SEARCH_RANGE);
+            if (players.empty())
+                return;
+
+            auto distanceToRaid = [&players](Creature const* egg)
+            {
+                float nearest = std::numeric_limits<float>::max();
+                for (Player const* p : players)
+                    nearest = std::min(nearest, egg->GetDistance(p));
+                return nearest;
+            };
+
+            std::vector<Creature*> eggs = FreeEggs();
+            std::sort(eggs.begin(), eggs.end(), [&](Creature const* a, Creature const* b)
+            {
+                return distanceToRaid(a) < distanceToRaid(b);
+            });
+            if (eggs.size() > EGGS_PER_HATCH)
+                eggs.resize(EGGS_PER_HATCH);
+            for (Creature* egg : eggs)
+                OrderHatching(egg);
+        }
+
+        Creature* HatchNearestEgg()
+        {
+            Creature* egg = NearestFreeEgg();
+            return egg ? HatchEgg(egg) : nullptr;
+        }
+
+        void EvolveNearestEgg()
+        {
+            Creature* egg = NearestFreeEgg();
+            if (!egg)
+                return;
+            _evolvedEgg = egg->GetGUID();
+            me->CastSpell(egg, SPELL_EVOLVE, false);
+        }
+
+        Creature* HatchEgg(Creature* egg)
+        {
+            bool const evolved = egg->GetGUID() == _evolvedEgg;
+            if (evolved)
+                _evolvedEgg.Clear();
+            Creature* spawn = me->SummonCreature(NPC_SPAWN_OF_MARLI, egg->GetPosition(),
+                TEMPSUMMON_CORPSE_TIMED_DESPAWN, 60000);
+            egg->DespawnOrUnsummon(0ms, EGG_REFILL);
+            if (!spawn)
+                return nullptr;
+            spawn->SetInCombatWithZone();
+            if (evolved)
+                DoCast(spawn, SPELL_EVOLVE, true);
+            return spawn;
+        }
+
+        void UpdateAI(uint32 diff) override
+        {
+            if (!UpdateVictim())
+                return;
+
+            if (!_drainSplashed.empty() && !DrainingLife())
+                EndDrainLifeSplash();
+
+            if (_avatar.Consumed(me))
+                TakeSpiderForm();
+
+            events.Update(diff);
+
+            if (me->HasUnitState(UNIT_STATE_CASTING))
+                return;
+
+            while (uint32 eventId = events.ExecuteEvent())
+            {
+                switch (eventId)
+                {
+                    case EVENT_THRASH:
+                        DoCastVictim(SPELL_THRASH);
+                        events.ScheduleEvent(EVENT_THRASH, 10s, 20s);
+                        break;
+                    case EVENT_DRAIN_LIFE:
+                        if (Unit* target = SelectTarget(SelectTargetMethod::Random, 0, DRAIN_LIFE_RANGE, true))
+                        {
+                            _drainTarget = target->GetGUID();
+                            _drainTick = Info(me, INFO_DRAIN_LIFE);
+                            me->CastCustomSpell(target, SPELL_DRAIN_LIFE, nullptr, &_drainTick, nullptr, false);
+                        }
+                        events.ScheduleEvent(EVENT_DRAIN_LIFE, 10s, 0, PHASE_TROLL);
+                        break;
+                    case EVENT_POISON_BOLT_VOLLEY:
+                        DoCastSelf(SPELL_POISON_BOLT_VOLLEY);
+                        events.ScheduleEvent(EVENT_POISON_BOLT_VOLLEY, 15s);
+                        break;
+                    case EVENT_HATCH_EGGS:
+                        DoCastSelf(SPELL_HATCH_EGGS);
+                        events.ScheduleEvent(EVENT_HATCH_EGGS, HATCH_EVERY);
+                        break;
+                    case EVENT_EVOLVE:
+                        EvolveNearestEgg();
+                        events.ScheduleEvent(EVENT_EVOLVE, 60s, 0, PHASE_TROLL);
+                        break;
+                    case EVENT_INFEST:
+                        if (Creature* spawn = HatchNearestEgg())
+                            DoCast(spawn, SPELL_INFEST);
+                        events.ScheduleEvent(EVENT_INFEST, 60s, 0, PHASE_SPIDER);
+                        break;
+                    case EVENT_ACID_SPIT:
+                        DoCastVictim(SPELL_ACID_SPIT);
+                        events.ScheduleEvent(EVENT_ACID_SPIT, 12s, 0, PHASE_SPIDER);
+                        break;
+                    case EVENT_WEB_SPRAY:
+                        DoCastVictim(SPELL_WEB_SPRAY);
+                        events.ScheduleEvent(EVENT_CHARGE, 5s, 0, PHASE_SPIDER);
+                        events.ScheduleEvent(EVENT_WEB_SPRAY, SpiderCycle(), 0, PHASE_SPIDER);
+                        break;
+                    case EVENT_CHARGE:
+                        // From stock: after the webs she goes for a caster out of reach.
+                        if (Unit* target = SelectTarget(SelectTargetMethod::Random, 0, [this](Unit* u)
+                            {
+                                return u->IsPlayer() && u->getPowerType() == POWER_MANA && !me->IsWithinMeleeRange(u) && u != me->GetVictim();
+                            }))
+                        {
+                            DoCast(target, SPELL_CHARGE);
+                            AttackStart(target);
+                        }
+                        break;
+                    case EVENT_POISON_SHOCK:
+                        DoCastSelf(SPELL_POISON_SHOCK);
+                        break;
+                    case EVENT_BURROW:
+                        DoCastSelf(SPELL_BURROW);
+                        events.ScheduleEvent(EVENT_BURROW, SpiderCycle(), 0, PHASE_SPIDER);
+                        break;
+                    case EVENT_EMERGE:
+                        EmergeAtFarthest();
+                        events.ScheduleEvent(EVENT_POISON_SHOCK, POISON_SHOCK_AFTER_EMERGE, 0, PHASE_SPIDER);
+                        break;
+                    case EVENT_END_HUNT:
+                        EndHunt();
+                        break;
+                }
+
+                if (me->HasUnitState(UNIT_STATE_CASTING))
+                    break;
+            }
+
+            DoMeleeAttackIfReady();
+        }
+
+    private:
+        bool _spider = false;
+        LoaAvatar _avatar{ NPC_AVATAR_OF_SHADRA, SPELL_DRAIN_POWER };
+        GuidSet _festering;
+        ObjectGuid _evolvedEgg;
+        GuidVector _drainSplashed;
+        ObjectGuid _drainTarget;
+        int32 _drainTick = 0;
+        ObjectGuid _hunted;
+        float _huntThreat = 0.0f;
+    };
+
+    // A Spider Egg never fights and players cannot touch it until its Hatching starts; it hatches only
+    // through Mar'li, once that cast completes, and no crowd control holds it.
+    struct npc_spider_egg_coa : public ScriptedAI
+    {
+        npc_spider_egg_coa(Creature* creature) : ScriptedAI(creature), _instance(creature->GetInstanceScript()) { }
+
+        void Reset() override
+        {
+            me->SetReactState(REACT_PASSIVE);
+            for (Mechanics mechanic : CROWD_CONTROL_MECHANICS)
+                me->ApplySpellImmune(0, IMMUNITY_MECHANIC, mechanic, true);
+            Seal(true);
+            _marli.Clear();
+            _hatched = false;
+        }
+
+        void AttackStart(Unit* /*who*/) override { }
+
+        void SetGUID(ObjectGuid const& guid, int32 id) override
+        {
+            if (id != DATA_HATCH_FOR_MARLI || me->HasUnitState(UNIT_STATE_CASTING))
+                return;
+            _marli = guid;
+            Seal(false);
+            DoCastSelf(SPELL_HATCHING);
+        }
+
+        void OnSpellCast(SpellInfo const* spell) override
+        {
+            if (spell->Id == SPELL_HATCHING)
+                _hatched = true;
+        }
+
+        void OnSpellFailed(SpellInfo const* spell) override
+        {
+            if (spell->Id == SPELL_HATCHING)
+                Seal(true);
+        }
+
+        void JustDied(Unit* /*killer*/) override
+        {
+            if (_instance)
+                if (Creature* marli = _instance->GetCreature(DATA_MARLI))
+                    if (marli->AI())
+                        marli->AI()->SetGUID(me->GetGUID(), DATA_EGG_DIED);
+            me->DespawnOrUnsummon(0ms, EGG_REFILL);
+        }
+
+        void UpdateAI(uint32 /*diff*/) override
+        {
+            if (_hatched)
+            {
+                _hatched = false;
+                if (Creature* marli = ObjectAccessor::GetCreature(*me, _marli))
+                    if (marli->AI())
+                        marli->AI()->SetGUID(me->GetGUID(), DATA_EGG_HATCHED);
+                return;
+            }
+
+            if (me->IsInCombat() && (!_instance || _instance->GetBossState(DATA_MARLI) != IN_PROGRESS))
+                EnterEvadeMode(EVADE_REASON_OTHER);
+        }
+
+    private:
+        void Seal(bool sealed) { me->SetImmuneToPC(sealed); }
+
+        InstanceScript* _instance;
+        ObjectGuid _marli;
+        bool _hatched = false;
+    };
+}
+
+void AddCoaMarliScripts()
+{
+    RegisterZulGurubCreatureAI(boss_marli_coa);
+    RegisterZulGurubCreatureAI(npc_spider_egg_coa);
+}

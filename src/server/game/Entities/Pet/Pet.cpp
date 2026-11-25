@@ -16,6 +16,7 @@
  */
 
 #include "Pet.h"
+#include "PetAI.h"
 #include "AreaDefines.h"
 #include "ArenaSpectator.h"
 #include "CharmInfo.h"
@@ -37,6 +38,15 @@
 #include "Util.h"
 #include "WorldPacket.h"
 #include "WorldSession.h"
+
+namespace
+{
+    // The Witch Hunter's Shadowhound keeps its corpse like a hunter pet, for Call From The Shadows to revive.
+    bool KeepsCorpse(Pet const* pet)
+    {
+        return pet->getPetType() == HUNTER_PET || pet->GetEntry() == 50124;
+    }
+}
 
 Pet::Pet(Player* owner, PetType type) : Guardian(nullptr, owner ? owner->GetGUID() : ObjectGuid::Empty),
     m_usedTalentCount(0),
@@ -114,9 +124,12 @@ void Pet::AddToWorld()
                 owner->SetLastPetSpell(GetUInt32Value(UNIT_CREATED_BY_SPELL));
             }
         }
-
-        sScriptMgr->OnPetAddToWorld(this);
     }
+
+    // a tamed pet enters the world before Unit::SetMinion gives it its owner GUID (Spell::EffectTameCreature):
+    // the hook goes by the owning player the pet was created for
+    if (GetOwner())
+        sScriptMgr->OnPetAddToWorld(this);
 }
 
 void Pet::RemoveFromWorld()
@@ -481,7 +494,7 @@ bool Pet::LoadPetFromDB(Player* owner, uint32 petEntry, uint32 petnumber, bool c
         }
         else
         {
-            if (!curHealth && getPetType() == HUNTER_PET)
+            if (!curHealth && KeepsCorpse(this))
                 setDeathState(DeathState::JustDied);
             else
             {
@@ -505,9 +518,19 @@ void Pet::SavePetToDB(PetSaveMode mode)
     if (!GetOwnerGUID().IsPlayer())
         return;
 
+    Player* owner = GetOwner();
+    if (!owner || !GetEntry() || !isControlled())
+        return;
+
+    if (mode == PET_SAVE_AS_DELETED)
+    {
+        RemoveAllAuras();
+        DeleteFromDB(m_charmInfo->GetPetNumber());
+        return;
+    }
+
     // dont allow to save pet when it is loaded, possibly bugs action bar!, save only fully controlled creature
-    Player* owner = GetOwner()->ToPlayer();
-    if (!owner || m_loading || !GetEntry() || !isControlled())
+    if (m_loading)
         return;
 
     // not save pet as current if another pet temporary unsummoned
@@ -555,6 +578,7 @@ void Pet::SavePetToDB(PetSaveMode mode)
             stmt->SetData(0, ownerLowGUID);
             stmt->SetData(1, uint8(PET_SAVE_AS_CURRENT));
             stmt->SetData(2, uint8(PET_SAVE_LAST_STABLE_SLOT));
+            stmt->SetData(3, uint8(HUNTER_PET));
             trans->Append(stmt);
         }
 
@@ -628,12 +652,15 @@ void Pet::setDeathState(DeathState s, bool /*despawn = false*/)                 
     Creature::setDeathState(s);
     if (getDeathState() == DeathState::Corpse)
     {
-        if (getPetType() == HUNTER_PET)
+        if (KeepsCorpse(this))
         {
             // pet corpse non lootable and non skinnable
             ReplaceAllDynamicFlags(UNIT_DYNFLAG_NONE);
             RemoveUnitFlag(UNIT_FLAG_SKINNABLE);
+        }
 
+        if (getPetType() == HUNTER_PET)
+        {
             //lose happiness when died and not in BG/Arena
             MapEntry const* mapEntry = sMapStore.LookupEntry(GetMapId());
             if (!mapEntry || (mapEntry->map_type != MAP_ARENA && mapEntry->map_type != MAP_BATTLEGROUND))
@@ -663,7 +690,7 @@ void Pet::Update(uint32 diff)
     {
         case DeathState::Corpse:
             {
-                if (getPetType() != HUNTER_PET || m_corpseRemoveTime <= GameTime::GetGameTime().count())
+                if (!KeepsCorpse(this) || m_corpseRemoveTime <= GameTime::GetGameTime().count())
                 {
                     Remove(PET_SAVE_NOT_IN_SLOT);               //hunters' pets never get removed because of death, NEVER!
                     return;
@@ -838,7 +865,13 @@ void Pet::Update(uint32 diff)
                     }
                 }
 
-                if (getPetType() == HUNTER_PET)
+                // CoA: Wildwalker pets are always happy (Ascension changelog 70528)
+                if (getPetType() == HUNTER_PET && GetOwner()->getClass() == CLASS_WILDWALKER)
+                {
+                    if (GetPower(POWER_HAPPINESS) != GetMaxPower(POWER_HAPPINESS))
+                        SetPower(POWER_HAPPINESS, GetMaxPower(POWER_HAPPINESS));
+                }
+                else if (getPetType() == HUNTER_PET)
                 {
                     m_happinessTimer -= diff;
                     if (m_happinessTimer <= int32(0))
@@ -1008,8 +1041,10 @@ bool Pet::CreateBaseAtTamed(CreatureTemplate const* cinfo, Map* map, uint32 phas
     {
         SetUInt32Value(UNIT_FIELD_BYTES_0, 0x02020100);
         SetSheath(SHEATH_STATE_MELEE);
-        SetByteFlag(UNIT_FIELD_BYTES_2, 2, UNIT_CAN_BE_RENAMED | UNIT_CAN_BE_ABANDONED);
     }
+    // CoA tames demons, undead, dragonkin and elementals too; without these flags the client offers
+    // Dismiss instead of Abandon, and that Dismiss deletes the hunter pet
+    SetByteFlag(UNIT_FIELD_BYTES_2, 2, UNIT_CAN_BE_RENAMED | UNIT_CAN_BE_ABANDONED);
 
     return true;
 }
@@ -1172,7 +1207,7 @@ bool Guardian::InitStatsForLevel(uint8 petlevel)
                     SetBaseWeaponDamage(BASE_ATTACK, MAXDAMAGE, float(petlevel + (petlevel / 4)));
                 }
 
-                switch (GetEntry())
+                switch (GetStockPetEntry(GetEntry()))
                 {
                     case NPC_WATER_ELEMENTAL_PERM:
                         {
@@ -1189,7 +1224,7 @@ bool Guardian::InitStatsForLevel(uint8 petlevel)
             }
         default:
             {
-                switch (GetEntry())
+                switch (GetStockPetEntry(GetEntry()))
                 {
                     case NPC_FIRE_ELEMENTAL:
                         {
@@ -1671,7 +1706,9 @@ void Pet::_SaveAuras(CharacterDatabaseTransaction trans)
             continue;
 
         Aura* aura = itr->second;
-        if (aura->GetDuration() < 60 * IN_MILLISECONDS)
+        // A permanent aura reports duration -1, so it must not be caught by this short-duration
+        // test: doing so drops it from every pet save, including the one taken at logout.
+        if (!aura->IsPermanent() && aura->GetDuration() < 60 * IN_MILLISECONDS)
             continue;
 
         // dont save infinite negative auras! (lavas, transformations etc)
@@ -1885,9 +1922,14 @@ bool Pet::learnSpell(uint32 spell_id)
 
     if (!m_loading)
     {
-        WorldPackets::Pet::PetLearnedSpell packet;
-        packet.SpellID = spell_id;
-        m_owner->SendDirectMessage(packet.Write());
+        // Ascension's pet families teach their scaling and passive auras as levelup spells; announce abilities only.
+        SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spell_id);
+        if (!spellInfo || !spellInfo->IsPassive())
+        {
+            WorldPackets::Pet::PetLearnedSpell packet;
+            packet.SpellID = spell_id;
+            m_owner->SendDirectMessage(packet.Write());
+        }
         m_owner->PetSpellInitialize();
     }
 
@@ -2261,6 +2303,11 @@ void Pet::ToggleAutocast(SpellInfo const* spellInfo, bool apply)
             }
         }
     }
+
+    // CoA: Windpelt's autocast decides whether the Air Elemental chases to range or into melee
+    if (spellInfo->Id == COA_AIR_ELEMENTAL_WINDPELT && GetStockPetEntry(GetEntry()) == ENTRY_COA_AIR_ELEMENTAL)
+        if (PetAI* ai = dynamic_cast<PetAI*>(AI()))
+            ai->RefreshChaseRange();
 }
 
 bool Pet::IsPermanentPetFor(Player* owner) const
@@ -2273,9 +2320,11 @@ bool Pet::IsPermanentPetFor(Player* owner) const
             else if (owner->IsClass(CLASS_DEATH_KNIGHT, CLASS_CONTEXT_PET))
                 return GetCreatureTemplate()->type == CREATURE_TYPE_UNDEAD;
             else if (owner->IsClass(CLASS_MAGE, CLASS_CONTEXT_PET))
-                return GetEntry() == 37994;
+                return GetStockPetEntry(GetEntry()) == NPC_WATER_ELEMENTAL_PERM;
+            else if (owner->IsClass(CLASS_TINKER, CLASS_CONTEXT_PET))
+                return GetCreatureTemplate()->type == CREATURE_TYPE_MECHANICAL;
             else
-                return false;
+                return IsAscensionClass(owner->getClass());
         case HUNTER_PET:
             return true;
         default:
@@ -2466,7 +2515,7 @@ Player* Pet::GetOwner() const
 
 float Pet::GetNativeObjectScale() const
 {
-    uint8 ctFamily = GetCreatureTemplate()->family;
+    uint32 ctFamily = GetCreatureTemplate()->family;
 
     CreatureFamilyEntry const* creatureFamily = sCreatureFamilyStore.LookupEntry(ctFamily);
     if (creatureFamily && creatureFamily->minScale > 0.0f && getPetType() & HUNTER_PET)

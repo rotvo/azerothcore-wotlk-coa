@@ -111,9 +111,24 @@ namespace CoAChallenges
         }
     }
 
+    // Only a seated food or drink aura counts (SpellInfo classifies it as
+    // SPELL_SPECIFIC_FOOD/DRINK). A bare regen aura type is not enough: class
+    // buffs, totems and procs share MOD_REGEN / MOD_POWER_REGEN with food and
+    // drink and would otherwise grant hunger/thirst immunity.
+    static bool HasConsumableAura(Player const* player, SpellSpecificType kind)
+    {
+        for (auto const& [spellId, application] : player->GetAppliedAuras())
+        {
+            SpellSpecificType const specific = application->GetBase()->GetSpellInfo()->GetSpellSpecific();
+            if (specific == kind || specific == SPELL_SPECIFIC_FOOD_AND_DRINK)
+                return true;
+        }
+        return false;
+    }
+
     // Per-player ticker (map thread). The counters are authoritative in
     // memory and flushed to the DB periodically / on logout. Rise: thirst
-    // +1/10s, hunger +1/16s. Fall: while the eat/drink regen aura is present,
+    // +1/10s, hunger +1/16s. Fall: while a food/drink aura is present,
     // -FoodRestore / -DrinkRestore every FoodTickMs / DrinkTickMs (default
     // 1 point each; drinking ticks ~3x faster than eating).
     // Tracked set is maintained on activate/stop/fail/login/logout.
@@ -134,8 +149,8 @@ namespace CoAChallenges
         uint32 maxV = sConfigMgr->GetOption<uint32>("CoAChallenges.HungerMax", 100);
         uint32 foodRestore = sConfigMgr->GetOption<uint32>("CoAChallenges.FoodRestore", 1);
         uint32 drinkRestore = sConfigMgr->GetOption<uint32>("CoAChallenges.DrinkRestore", 1);
-        bool eating = player->HasAuraType(SPELL_AURA_MOD_REGEN);
-        bool drinking = player->HasAuraType(SPELL_AURA_MOD_POWER_REGEN);
+        bool eating = HasConsumableAura(player, SPELL_SPECIFIC_FOOD);
+        bool drinking = HasConsumableAura(player, SPELL_SPECIFIC_DRINK);
 
         struct Changed { uint32 challengeID; int32 hunger; int32 thirst; };
         std::vector<Changed> changed;
@@ -256,22 +271,21 @@ namespace CoAChallenges
     {
         if (!player)
             return;
+        RefreshHungerTracking(player, LoadActiveChallengeRows(player->GetGUID().GetCounter()));
+    }
+
+    void RefreshHungerTracking(Player* player, std::vector<ActiveChallengeRow> const& rows)
+    {
+        if (!player)
+            return;
         uint32 guid = player->GetGUID().GetCounter();
 
         // Build the fresh state (DB reads) BEFORE taking HungerMutex: holding the
         // lock across synchronous queries stalls every other player's hunger tick.
         HungerClock fresh;
-        if (QueryResult r = CharacterDatabase.Query(
-                "SELECT challengeId, hunger, thirst FROM coa_character_challenge WHERE guid = {}", guid))
-        {
-            do
-            {
-                Field* f = r->Fetch();
-                uint32 challengeID = f[0].Get<uint32>();
-                if (IsHungerChallenge(challengeID))
-                    fresh.state[challengeID] = HungerState{ f[1].Get<int32>(), f[2].Get<int32>() };
-            } while (r->NextRow());
-        }
+        for (ActiveChallengeRow const& row : rows)
+            if (IsHungerChallenge(row.challengeId))
+                fresh.state[row.challengeId] = HungerState{ row.hunger, row.thirst };
         // Survivalist gamemode: run hunger globally for this character. Read the
         // cached mask (the login recompute just wrote it) instead of re-querying
         // the async-updated row.

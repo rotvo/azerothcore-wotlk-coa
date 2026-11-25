@@ -39,6 +39,8 @@ enum RogueSpells
     SPELL_ROGUE_KILLING_SPREE_TELEPORT          = 57840,
     SPELL_ROGUE_KILLING_SPREE_WEAPON_DMG        = 57841,
     SPELL_ROGUE_KILLING_SPREE_DMG_BUFF          = 61851,
+    SPELL_ROGUE_EDGE_OF_FURY_TALENT             = 276397,
+    SPELL_ROGUE_EDGE_OF_FURY_TOGGLE             = 985227,
     SPELL_ROGUE_PREY_ON_THE_WEAK                = 58670,
     SPELL_ROGUE_SHIV_TRIGGERED                  = 5940,
     SPELL_ROGUE_TRICKS_OF_THE_TRADE             = 57934,
@@ -318,7 +320,7 @@ class spell_rog_killing_spree_aura : public AuraScript
 
     void HandleApply(AuraEffect const* /*aurEff*/, AuraEffectHandleModes /*mode*/)
     {
-        GetTarget()->CastSpell(GetTarget(), SPELL_ROGUE_KILLING_SPREE_DMG_BUFF, true);
+        GetTarget()->CastSpell(GetTarget(), sSpellMgr->GetSpellTwinFor(SPELL_ROGUE_KILLING_SPREE_DMG_BUFF, GetId()), true);
     }
 
     void HandleEffectPeriodic(AuraEffect const* /*aurEff*/)
@@ -335,13 +337,23 @@ class spell_rog_killing_spree_aura : public AuraScript
                     continue;
                 }
 
-                GetTarget()->CastSpell(target, SPELL_ROGUE_KILLING_SPREE_TELEPORT, true);
+                GetTarget()->CastSpell(target, sSpellMgr->GetSpellTwinFor(SPELL_ROGUE_KILLING_SPREE_TELEPORT, GetId()), true);
+
+                // Ascension Edge of Fury (talent 276397, toggle 985227): "Killing Spree no longer teleports you"; the
+                // teleport spell still lands (its other effects stay), spell_dummyfix_rogue_edge_of_fury_teleport
+                // cancels the move itself, and the hits come from the rogue's current position
+                bool const keepPosition = GetTarget()->HasAura(SPELL_ROGUE_EDGE_OF_FURY_TALENT) ||
+                    GetTarget()->HasAura(SPELL_ROGUE_EDGE_OF_FURY_TOGGLE);
 
                 // xinef: ensure fast coordinates switch, dont wait for client to send opcode
-                WorldLocation const& dest = GetTarget()->ToPlayer()->GetTeleportDest();
-                GetTarget()->ToPlayer()->UpdatePosition(dest, true);
+                if (!keepPosition)
+                {
+                    WorldLocation const& dest = GetTarget()->ToPlayer()->GetTeleportDest();
+                    GetTarget()->ToPlayer()->UpdatePosition(dest, true);
+                }
 
-                GetTarget()->CastSpell(target, SPELL_ROGUE_KILLING_SPREE_WEAPON_DMG, TriggerCastFlags(TRIGGERED_FULL_MASK & ~TRIGGERED_DONT_REPORT_CAST_ERROR));
+                GetTarget()->CastSpell(target, sSpellMgr->GetSpellTwinFor(SPELL_ROGUE_KILLING_SPREE_WEAPON_DMG, GetId()),
+                    TriggerCastFlags(TRIGGERED_FULL_MASK & ~TRIGGERED_DONT_REPORT_CAST_ERROR));
                 break;
             }
             else
@@ -351,7 +363,7 @@ class spell_rog_killing_spree_aura : public AuraScript
 
     void HandleRemove(AuraEffect const* /*aurEff*/, AuraEffectHandleModes /*mode*/)
     {
-        GetTarget()->RemoveAurasDueToSpell(SPELL_ROGUE_KILLING_SPREE_DMG_BUFF);
+        GetTarget()->RemoveAurasDueToSpell(sSpellMgr->GetSpellTwinFor(SPELL_ROGUE_KILLING_SPREE_DMG_BUFF, GetId()));
     }
 
 public:
@@ -404,7 +416,7 @@ class spell_rog_killing_spree : public SpellScript
 
     void HandleDummy(SpellEffIndex /*effIndex*/)
     {
-        if (Aura* aura = GetCaster()->GetAura(SPELL_ROGUE_KILLING_SPREE))
+        if (Aura* aura = GetCaster()->GetAura(GetSpellInfo()->Id))
         {
             if (spell_rog_killing_spree_aura* script = dynamic_cast<spell_rog_killing_spree_aura_script*>(aura->GetScriptByName(KillingSpreeScriptName)))
                 script->AddTarget(GetHitUnit());
@@ -472,7 +484,7 @@ class spell_rog_preparation : public SpellScript
         Player* caster = GetCaster()->ToPlayer();
         //immediately finishes the cooldown on certain Rogue abilities
 
-        bool hasGlyph = caster->HasAura(SPELL_ROGUE_GLYPH_OF_PREPARATION);
+        bool hasGlyph = caster->HasAuraOrTwin(SPELL_ROGUE_GLYPH_OF_PREPARATION);
         PlayerSpellMap const& spellMap = caster->GetSpellMap();
         for (PlayerSpellMap::const_iterator itr = spellMap.begin(); itr != spellMap.end(); ++itr)
         {
@@ -558,11 +570,19 @@ class spell_rog_rupture : public AuraScript
         return caster && caster->IsPlayer();
     }
 
-    void CalculateAmount(AuraEffect const* /*aurEff*/, int32& amount, bool& canBeRecalculated)
+    void CalculateAmount(AuraEffect const* aurEff, int32& amount, bool& canBeRecalculated)
     {
         if (Unit* caster = GetCaster())
         {
             canBeRecalculated = false;
+
+            // Ascension's Rupture ranks carry their own (AP+SP) * cp * cp coefficient
+            if (GetSpellInfo()->HasComboPointPowerBonus(aurEff->GetEffIndex()))
+            {
+                amount += GetSpellInfo()->GetComboPointPowerBonus(caster, aurEff->GetEffIndex(),
+                    std::min<uint32>(caster->ToPlayer()->GetComboPoints(), 5));
+                return;
+            }
 
             float const attackpowerPerCombo[6] =
             {

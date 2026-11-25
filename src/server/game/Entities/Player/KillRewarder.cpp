@@ -24,6 +24,14 @@
 #include "ScriptMgr.h"
 #include "SpellAuraDefines.h"
 #include "SpellAuraEffects.h"
+#include "World.h"
+
+namespace
+{
+// CoA's SPELL_AURA_MOD_XP_PCT MiscValue is a mask of XP sources: 1 kills, 2 quests, 4 professions, 8 battlegrounds.
+constexpr int32 XP_SOURCE_MASK_KILL = 1;
+constexpr int32 XP_SOURCE_MASK_BATTLEGROUND = 8;
+}
 
 // KillRewarder incapsulates logic of rewarding player upon kill with:
 // * XP;
@@ -104,8 +112,11 @@ void KillRewarder::_InitGroupData()
                         }
                         // 2.4. _maxNotGrayMember - maximum level of alive group member within reward distance,
                         //      for whom victim is not gray;
+                        // Gray is decided per member: with open-world scaling the victim stands at a
+                        // different level for each of them, so one member's scaled kill can be another
+                        // member's gray kill. Without a view this is the object's own level.
                         uint32 grayLevel = Acore::XP::GetGrayLevel(lvl);
-                        if (_victim->GetLevel() > grayLevel && (!_maxNotGrayMember || _maxNotGrayMemberLevel < lvl))
+                        if (_victim->getRewardLevelForTarget(member) > grayLevel && (!_maxNotGrayMember || _maxNotGrayMemberLevel < lvl))
                         {
                             _maxNotGrayMember = member;
                             _maxNotGrayMemberLevel = lvl;
@@ -171,18 +182,26 @@ void KillRewarder::_RewardXP(Player* player, float rate)
         {
             uint8 const referenceLevel = _group ? _maxLevel : player->GetLevel();
             uint8 const highestLevel = creature->GetHighestPlayerAttackerLevel();
-            if (highestLevel > referenceLevel && creature->GetLevel() <= Acore::XP::GetGrayLevel(highestLevel))
+            if (highestLevel > referenceLevel && creature->getRewardLevelForTarget(player) <= Acore::XP::GetGrayLevel(highestLevel))
                 xp = xp / 2 + 1;
         }
 
     if (xp)
     {
-        // 4.2.2. Apply auras modifying rewarded XP (SPELL_AURA_MOD_XP_PCT).
+        // 4.2.2. Apply auras modifying rewarded XP (SPELL_AURA_MOD_XP_PCT). A
+        // NO_BONUS_EXPERIENCE challenge drops the positive bonuses but keeps penalties
+        // (XP Lock, challenge drawbacks).
         bool const recruitAFriend = player->GetsRecruitAFriendBonus(true);
-        xp *= player->GetTotalAuraMultiplier(SPELL_AURA_MOD_XP_PCT, [recruitAFriend](AuraEffect const* effect)
+        bool const noBonusExperience = sScriptMgr->OnPlayerHasNoBonusExperience(player);
+        int32 const sourceMask = _victim->IsPlayer() ? XP_SOURCE_MASK_KILL | XP_SOURCE_MASK_BATTLEGROUND : XP_SOURCE_MASK_KILL;
+        xp *= player->GetTotalAuraMultiplier(SPELL_AURA_MOD_XP_PCT, [recruitAFriend, noBonusExperience, sourceMask](AuraEffect const* effect)
         {
+            if ((effect->GetMiscValue() & sourceMask) == 0)
+                return false;
             // CoA's party Aura of Experience explicitly excludes the recruit-a-friend bonus.
-            return effect->GetId() != 818059 || !recruitAFriend;
+            if (effect->GetId() == 818059 && recruitAFriend)
+                return false;
+            return !noBonusExperience || effect->GetAmount() <= 0;
         });
 
         // 4.2.3. Give XP to player.
@@ -302,6 +321,9 @@ void KillRewarder::Reward()
         // 3.2. Reward single killer (not group case).
         // 3.2.1. Initialize initial XP amount based on killer's level.
         _InitXP(_killer);
+        if (Creature const* creature = _victim->ToCreature())
+            if (sWorld->getBoolConfig(CONFIG_SOLO_KILL_REQUIRES_PLAYER_HIT) && !creature->WasAttackedDirectlyBy(_killer->GetGUID()))
+                _xp = 0;
         // To avoid unnecessary calculations and calls,
         // proceed only if XP is not ZERO or player is not on battleground
         // (battleground rewards only XP, that's why).
@@ -313,7 +335,8 @@ void KillRewarder::Reward()
 
     // 5. Credit instance encounter.
     if (Creature* victim = _victim->ToCreature())
-        if (victim->IsDungeonBoss())
+        if (victim->IsDungeonBoss() ||
+            (!victim->GetOwnerGUID().IsPlayer() && sObjectMgr->IsRaidEncounterKillCredit(victim->GetEntry())))
             if (Map* map = _victim->FindMap())
                 map->UpdateEncounterState(ENCOUNTER_CREDIT_KILL_CREATURE, _victim->GetEntry(), _victim);
 }

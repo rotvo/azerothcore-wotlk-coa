@@ -393,6 +393,13 @@ void WorldSession::HandleMessagechatOpcode(WorldPacket& recvData)
             break;
         case CHAT_MSG_WHISPER:
             {
+                if (lang != LANG_ADDON)
+                    resolveWhisperTarget(to, msg, [](std::string const& firstName)
+                        {
+                            Player* player = ObjectAccessor::FindUniquePlayerByFirstName(firstName);
+                            return player ? player->GetName() : std::string();
+                        });
+
                 if (!normalizePlayerName(to))
                 {
                     SendPlayerNotFoundNotice(to);
@@ -473,6 +480,7 @@ void WorldSession::HandleMessagechatOpcode(WorldPacket& recvData)
                 WorldPacket data;
                 ChatHandler::BuildChatPacket(data, ChatMsg(type), Language(lang), sender, nullptr, msg);
                 group->BroadcastPacket(&data, false, group->GetMemberGroup(GetPlayer()->GetGUID()));
+                sScriptMgr->OnPlayerAfterChat(GetPlayer(), type, lang, msg, group);
             }
             break;
         case CHAT_MSG_GUILD:
@@ -485,6 +493,8 @@ void WorldSession::HandleMessagechatOpcode(WorldPacket& recvData)
                             return;
 
                         guild->BroadcastToGuild(this, false, msg, lang == LANG_ADDON ? LANG_ADDON : LANG_UNIVERSAL);
+                        if (guild->HasRankRight(GetPlayer(), GR_RIGHT_GCHATSPEAK))
+                            sScriptMgr->OnPlayerAfterChat(GetPlayer(), type, lang, msg, guild);
                     }
                 }
             }
@@ -499,6 +509,8 @@ void WorldSession::HandleMessagechatOpcode(WorldPacket& recvData)
                             return;
 
                         guild->BroadcastToGuild(this, true, msg, lang == LANG_ADDON ? LANG_ADDON : LANG_UNIVERSAL);
+                        if (guild->HasRankRight(GetPlayer(), GR_RIGHT_OFFCHATSPEAK))
+                            sScriptMgr->OnPlayerAfterChat(GetPlayer(), type, lang, msg, guild);
                     }
                 }
             }
@@ -520,6 +532,7 @@ void WorldSession::HandleMessagechatOpcode(WorldPacket& recvData)
                 WorldPacket data;
                 ChatHandler::BuildChatPacket(data, CHAT_MSG_RAID, Language(lang), sender, nullptr, msg);
                 group->BroadcastPacket(&data, false);
+                sScriptMgr->OnPlayerAfterChat(GetPlayer(), type, lang, msg, group);
             }
             break;
         case CHAT_MSG_RAID_LEADER:
@@ -539,6 +552,7 @@ void WorldSession::HandleMessagechatOpcode(WorldPacket& recvData)
                 WorldPacket data;
                 ChatHandler::BuildChatPacket(data, CHAT_MSG_RAID_LEADER, Language(lang), sender, nullptr, msg);
                 group->BroadcastPacket(&data, false);
+                sScriptMgr->OnPlayerAfterChat(GetPlayer(), type, lang, msg, group);
             }
             break;
         case CHAT_MSG_RAID_WARNING:
@@ -554,6 +568,7 @@ void WorldSession::HandleMessagechatOpcode(WorldPacket& recvData)
                 WorldPacket data;
                 ChatHandler::BuildChatPacket(data, CHAT_MSG_RAID_WARNING, Language(lang), sender, nullptr, msg);
                 group->BroadcastPacket(&data, false);
+                sScriptMgr->OnPlayerAfterChat(GetPlayer(), type, lang, msg, group);
             }
             break;
         case CHAT_MSG_BATTLEGROUND:
@@ -569,6 +584,7 @@ void WorldSession::HandleMessagechatOpcode(WorldPacket& recvData)
                 WorldPacket data;
                 ChatHandler::BuildChatPacket(data, CHAT_MSG_BATTLEGROUND, Language(lang), sender, nullptr, msg);
                 group->BroadcastPacket(&data, false);
+                sScriptMgr->OnPlayerAfterChat(GetPlayer(), type, lang, msg, group);
             }
             break;
         case CHAT_MSG_BATTLEGROUND_LEADER:
@@ -584,6 +600,7 @@ void WorldSession::HandleMessagechatOpcode(WorldPacket& recvData)
                 WorldPacket data;
                 ChatHandler::BuildChatPacket(data, CHAT_MSG_BATTLEGROUND_LEADER, Language(lang), sender, nullptr, msg);
                 group->BroadcastPacket(&data, false);
+                sScriptMgr->OnPlayerAfterChat(GetPlayer(), type, lang, msg, group);
             }
             break;
         case CHAT_MSG_CHANNEL:

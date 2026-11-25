@@ -33,6 +33,7 @@ class Player;
 class Unit;
 class ProcEventInfo;
 struct SkillLineAbilityEntry;
+struct SpellEntry;
 
 #define SPELL_RELIC_COOLDOWN      1
 
@@ -92,13 +93,15 @@ enum SpellFamilyFlag
     SPELLFAMILYFLAG_SHAMAN_TOTEM_EFFECTS    = 0x04000000,  // Seems to be linked to most totems and some totem effects
 };
 
-#define SPELL_LINKED_MAX_SPELLS  200000
+// Linked-spell types share one map keyed by spell id + type * SPELL_LINKED_MAX_SPELLS, so the stride must exceed
+// every spell id: CoA's client data holds spell ids up to about 14 million.
+#define SPELL_LINKED_MAX_SPELLS  100000000
 
 enum SpellLinkedType
 {
     SPELL_LINK_CAST     = 0,            // +: cast; -: remove
-    SPELL_LINK_HIT      = 1 * 200000,
-    SPELL_LINK_AURA     = 2 * 200000,   // +: aura; -: immune
+    SPELL_LINK_HIT      = 1 * SPELL_LINKED_MAX_SPELLS,
+    SPELL_LINK_AURA     = 2 * SPELL_LINKED_MAX_SPELLS,   // +: aura; -: immune
     SPELL_LINK_REMOVE   = 0,
 };
 
@@ -506,6 +509,16 @@ public:
         return damage;
     }
 
+    /// the same pet auras for a Warcraft Reborn twin: each aura replaced by its own twin
+    template <typename Resolve>
+    [[nodiscard]] PetAura ForTwin(Resolve&& resolve) const
+    {
+        PetAura copy = *this;
+        for (auto& [petEntry, aura] : copy.auras)
+            aura = resolve(aura);
+        return copy;
+    }
+
 private:
     PetAuraMap auras;
     bool removeOnChangePet{false};
@@ -634,6 +647,63 @@ inline bool IsProfessionOrRidingSkill(uint32 skill)
     return  IsProfessionSkill(skill) || skill == SKILL_RIDING;
 }
 
+// Conquest of Azeroth adds Novice Riding (50) as riding step 1, so the classic ranks start at step 2.
+enum RidingSkillValue : uint16
+{
+    RIDING_SKILL_NOVICE        = 50,
+    RIDING_SKILL_APPRENTICE    = 75,
+    RIDING_SKILL_JOURNEYMAN    = 150,
+    RIDING_SKILL_EXPERT        = 225,
+    RIDING_SKILL_ARTISAN       = 300,
+    RIDING_SKILL_EXTRAORDINARY = 375
+};
+
+constexpr int32 NOVICE_RIDING_MOUNT_SPEED = 40;
+
+// Conquest of Azeroth mounts take their speed from the rider's riding skill instead of the mount spell.
+inline int32 GetRidingGroundMountSpeed(uint16 riding)
+{
+    if (riding >= RIDING_SKILL_JOURNEYMAN)
+        return 100;
+    return riding >= RIDING_SKILL_APPRENTICE ? 60 : NOVICE_RIDING_MOUNT_SPEED;
+}
+
+inline int32 GetRidingFlightMountSpeed(uint16 riding)
+{
+    if (riding >= RIDING_SKILL_EXTRAORDINARY)
+        return 310;
+    if (riding >= RIDING_SKILL_ARTISAN)
+        return 280;
+    return riding >= RIDING_SKILL_EXPERT ? 150 : 0;
+}
+
+inline uint16 GetSkillValueForStep(uint32 skill, uint16 step)
+{
+    if (skill == SKILL_RIDING && step)
+        return step == 1 ? RIDING_SKILL_NOVICE : (step - 1) * 75;
+
+    return step * 75;
+}
+
+// Classic professions end at Artisan (skill step 4); each expansion adds the next rank (Master, Grand Master).
+inline uint16 GetMaxProfessionSkillStep(uint8 expansion)
+{
+    return 4 + expansion;
+}
+
+inline uint8 GetProfessionExpansion(uint32 skill)
+{
+    switch (skill)
+    {
+        case SKILL_JEWELCRAFTING:
+            return EXPANSION_THE_BURNING_CRUSADE;
+        case SKILL_INSCRIPTION:
+            return EXPANSION_WRATH_OF_THE_LICH_KING;
+        default:
+            return EXPANSION_CLASSIC;
+    }
+}
+
 bool IsPartOfSkillLine(uint32 skillId, uint32 spellId);
 
 // spell diminishing returns
@@ -679,6 +749,9 @@ public:
     [[nodiscard]] uint8 GetSpellRank(uint32 spell_id) const;
     // not strict check returns provided spell if rank not avalible
     [[nodiscard]] uint32 GetSpellWithRank(uint32 spell_id, uint32 rank, bool strict = false) const;
+    /// The spell of relatedSpellId's rank in the chain of stockFirstRank, or of its twin when relatedSpellId is a twin:
+    /// twin chains keep their own rank numbers, which can differ from the stock chain's
+    [[nodiscard]] uint32 GetSpellWithRankFor(uint32 stockFirstRank, uint32 relatedSpellId, bool strict = false) const;
 
     // Spell Required table
     [[nodiscard]] Acore::IteratorPair<SpellRequiredMap::const_iterator>GetSpellsRequiredForSpellBounds(uint32 spell_id) const;
@@ -767,6 +840,9 @@ public:
     }
     [[nodiscard]] uint32 GetSpellInfoStoreSize() const { return mSpellInfoMap.size(); }
 
+    // Startup-only registration; the store owns the result and refuses to replace existing spells.
+    SpellInfo* RegisterRuntimeSpell(SpellEntry const& entry);
+
     // Talent Additional Set
     [[nodiscard]] bool IsAdditionalTalentSpell(uint32 spellId) const;
 
@@ -782,6 +858,31 @@ public:
     void UnloadSpellInfoChains();
     void LoadSpellTalentRanks();
     void LoadSpellRanks();
+    [[nodiscard]] std::vector<std::vector<uint32>> LoadClientSpellRankChains() const;
+    /// rank chains a module adds after `spell_ranks`; a chain touching an already ranked spell is skipped
+    using AddedSpellRanks = std::vector<std::vector<uint32>> (*)();
+    void SetAddedSpellRanks(AddedSpellRanks ranks) { _addedSpellRanks = ranks; }
+    void LoadAddedSpellRanks();
+    /// (source, twin) spell pairs a module adds; a twin without its own database row takes its source's
+    /// called before spell corrections (ranked = false) and again once rank chains are known (ranked = true)
+    using SpellTwins = std::vector<std::pair<uint32, uint32>> (*)(bool ranked);
+    void SetSpellTwins(SpellTwins twins) { _spellTwinSource = twins; }
+    /// (stock, spell) pairs that share a name but not a layout: matched by id lookups, never given stock data
+    using SpellNamesakes = std::vector<std::pair<uint32, uint32>> (*)();
+    void SetSpellNamesakes(SpellNamesakes namesakes) { _spellNamesakeSource = namesakes; }
+    /// a stock spell with its twins and namesakes
+    [[nodiscard]] std::vector<uint32> GetSpellAndRelatives(uint32 spellId) const;
+    void LoadSpellTwins(bool ranked);
+    [[nodiscard]] std::unordered_multimap<uint32, uint32> const& GetSpellTwins() const { return _spellTwins; }
+    /// the spell a twin takes its data from, or the spell itself
+    [[nodiscard]] uint32 GetSpellTwinSource(uint32 spellId) const;
+    /// the twin or namesake of a stock spell that belongs with a related spell's own twin, or the stock spell
+    [[nodiscard]] uint32 GetSpellTwinFor(uint32 stockSpellId, uint32 relatedSpellId) const;
+    /// the twin whose script is running on this thread (a stock script bound to it through its stock spell), or 0
+    static void PushScriptTwin(uint32 spellId, uint32 triggeringSpellId = 0);
+    static void PopScriptTwin(uint32 spellId);
+    [[nodiscard]] static uint32 GetRunningScriptTwin();
+    [[nodiscard]] static uint32 GetScriptTwinOf(uint32 spellId);
     void LoadSpellRequired();
     void LoadSpellLearnSkills();
     void LoadSpellTargetPositions();
@@ -812,6 +913,16 @@ public:
     void LoadSpellJumpDistances();
 
 private:
+    template <class Store>
+    void CopyToSpellTwins(Store& store);
+
+    AddedSpellRanks            _addedSpellRanks = nullptr;
+    SpellTwins                 _spellTwinSource = nullptr;
+    std::unordered_multimap<uint32, uint32> _spellTwins;
+    std::unordered_map<uint32, uint32> _spellTwinSources;
+    SpellNamesakes             _spellNamesakeSource = nullptr;
+    std::unordered_multimap<uint32, uint32> _spellNamesakes;
+    std::unordered_map<uint32, uint32> _spellNamesakeSources;
     SpellDifficultySearcherMap mSpellDifficultySearcherMap;
     SpellChainMap              mSpellChains;
     SpellsRequiringSpellMap    mSpellsReqSpell;

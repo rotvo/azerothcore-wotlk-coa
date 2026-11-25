@@ -24,6 +24,7 @@
 #include "SpellMgr.h"
 #include "StringFormat.h"
 #include "TaskScheduler.h"
+#include "AscensionPersonalBank.h"
 #include "World.h"
 #include "WorldSession.h"
 #include <algorithm>
@@ -80,6 +81,7 @@ namespace CoAChallenges
         // flags last so the character ends up truly clean.
         WaitCharacterQueueEmpty();
         CharacterDatabase.DirectExecute("DELETE FROM coa_character_condition WHERE guid = {}", guid);
+        ResetConditionFlags(guid);
 
         LOG_INFO("module.coa_challenges", "Test reset {}: level 1, 0 money, no challenges",
             player->GetName());
@@ -146,12 +148,47 @@ namespace CoAChallenges
         ClearCharChallengeCache(guid);
         ApplyChallengeSpell(player, challengeId);
         TrackHunger(player, challengeId);
+        for (Objective const& o : GetObjectives(challengeId))
+            if (o.type == "CHALLENGE_REQUIREMENT_TYPE_DUO" || o.type == "CHALLENGE_REQUIREMENT_TYPE_TRIO")
+                SetObjectiveDone(guid, challengeId, o.key);
         SendChallengeResponse(player, SMSG_COA_CHALLENGE_START_RESPONSE,
             challengeId, 1, 0, "CHALLENGE_START_OK");
         // Seed the client's active + criteria caches so the per-objective
         // banner (0x59A) has an entry to transition.
         SendActiveList(player);
         SendCriteriaState(player);
+    }
+
+    void SatisfyObjectiveForTest(Player* player, Objective const& o)
+    {
+        uint32 const target = CoAParse::ObjectiveTarget(o);
+        if (o.type == "CHALLENGE_REQUIREMENT_TYPE_KILL_CREATURE_BEFORE_LEVEL")
+        {
+            if (Creature* c = player->SummonCreature(target, *player, TEMPSUMMON_TIMED_DESPAWN, 30000))
+                Unit::Kill(player, c);
+        }
+        else if (o.type == "CHALLENGE_REQUIREMENT_TYPE_LOOT_ITEM_BEFORE_LEVEL")
+        {
+            ItemPosCountVec dest;
+            if (player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, target, 1) != EQUIP_ERR_OK)
+                return;
+            if (Item* item = player->StoreNewItem(dest, target, true))
+                sScriptMgr->OnPlayerLootItem(player, item, 1, ObjectGuid::Empty);
+        }
+        else if (o.type == "CHALLENGE_REQUIREMENT_TYPE_COMPLETE_QUEST_BEFORE_LEVEL")
+        {
+            if (Quest const* quest = sObjectMgr->GetQuestTemplate(target))
+                sScriptMgr->OnPlayerCompleteQuest(player, quest);
+        }
+    }
+
+    std::string ObjectiveTestLabel(Objective const& o)
+    {
+        if (o.type == "CHALLENGE_REQUIREMENT_TYPE_LOOT_ITEM_BEFORE_LEVEL")
+            return Acore::StringFormat("looted item {}", CoAParse::ObjectiveTarget(o));
+        if (o.type == "CHALLENGE_REQUIREMENT_TYPE_COMPLETE_QUEST_BEFORE_LEVEL")
+            return Acore::StringFormat("completed quest {}", CoAParse::ObjectiveTarget(o));
+        return Acore::StringFormat("killed entry {}", CoAParse::ObjectiveTarget(o));
     }
 
     // ---- Scheduled (visual) E2E runner ----------------------------------
@@ -429,22 +466,19 @@ namespace CoAChallenges
                 Player* killer = players.front();
                 for (Objective const& o : run->byLevel[level])
                 {
-                    Creature* c = killer->SummonCreature(o.v1, *killer,
-                        TEMPSUMMON_TIMED_DESPAWN, 30000);
-                    if (c)
-                        Unit::Kill(killer, c);   // CreditKill shares it with the group
+                    SatisfyObjectiveForTest(killer, o);
 
                     std::string missing;
                     for (Player* player : players)
                         if (!IsObjectiveDone(player->GetGUID().GetCounter(), run->challengeId, o.key))
                             missing += (missing.empty() ? "" : ",") + player->GetName();
                     if (missing.empty())
-                        BroadcastTestLine(players, "  killed entry {} (before level {}) -> credited to all {} member(s)",
-                            o.v1, level, (uint32)players.size());
+                        BroadcastTestLine(players, "  {} (before level {}) -> credited to all {} member(s)",
+                            ObjectiveTestLabel(o), level, (uint32)players.size());
                     else
                     {
-                        BroadcastTestLine(players, "  kill entry {} (before level {}) -> NOT marked for: {}",
-                            o.v1, level, missing);
+                        BroadcastTestLine(players, "  {} (before level {}) -> NOT marked for: {}",
+                            ObjectiveTestLabel(o), level, missing);
                         run->pass = false;
                     }
                 }
@@ -498,15 +532,15 @@ namespace CoAChallenges
                     // Everything except this gate's objectives is satisfied, so
                     // the ONLY thing blocking the gate is the kill we skipped.
                     for (Objective const& o : GetObjectives(run->challengeId))
-                        if (IsTrackedObjective(o.type) && o.v2 != level)
+                        if (IsTrackedObjective(o.type) && CoAParse::ObjectiveGateLevel(o) != level)
                             SetObjectiveDone(guid, run->challengeId, o.key);
                     if (player->GetLevel() < level - 1)
                         player->GiveLevel(static_cast<uint8>(level - 1));
                 }
                 std::string entries;
                 for (Objective const& o : run->byLevel[level])
-                    entries += (entries.empty() ? "" : ",") + std::to_string(o.v1);
-                BroadcastTestLine(players, "  gate {} @ level {}: skipping kill of [{}]",
+                    entries += (entries.empty() ? "" : ",") + std::to_string(CoAParse::ObjectiveTarget(o));
+                BroadcastTestLine(players, "  gate {} @ level {}: skipping objectives [{}]",
                     run->missIdx + 1, level, entries);
                 run->phase = LevelGateRun::MissLevel;
                 break;
@@ -557,8 +591,8 @@ namespace CoAChallenges
         run->pauseMs = pauseMs;
         run->missPass = missPass;
         for (Objective const& o : GetObjectives(challengeId))
-            if (IsTrackedObjective(o.type) && o.v2)
-                run->byLevel[o.v2].push_back(o);
+            if (IsTrackedObjective(o.type) && CoAParse::ObjectiveGateLevel(o))
+                run->byLevel[CoAParse::ObjectiveGateLevel(o)].push_back(o);
         if (run->byLevel.empty())
             return false;
         for (auto const& [lvl, _] : run->byLevel)
@@ -572,9 +606,10 @@ namespace CoAChallenges
     }
 
     // ---- Fatigue visual runner (Narcolepsy) ------------------------------
-    // Fills the native fatigue bar to max; the module then sleeps (kills) the
+    // Drains the native fatigue bar to 0; the module then sleeps (kills) the
     // char with a "Fell Asleep" cause. Asserts the death, the challenge failure
-    // and the recorded broadcast cause.
+    // and the recorded broadcast cause. The character must be outside a
+    // sanctuary (starter zones/rest areas are treated as safe).
     struct FatigueRun
     {
         std::string playerName;
@@ -606,7 +641,7 @@ namespace CoAChallenges
                     if (player->GetLevel() < 10)
                         player->GiveLevel(10);   // above AnnounceFailureMinLevel
                 }
-                BroadcastTestLine(players, "E2E fatigue {}: filling bar to max", run->challengeId);
+                BroadcastTestLine(players, "E2E fatigue {}: draining bar to 0", run->challengeId);
                 run->phase = FatigueRun::Fill;
                 break;
             }
@@ -614,9 +649,11 @@ namespace CoAChallenges
             {
                 for (Player* player : players)
                 {
-                    player->RemovePlayerFlag(PLAYER_FLAGS_RESTING);  // else the bar resets
-                    bool ok = Test_SetFatigue(player, 1000);   // clamps to FatigueMax
-                    BroadcastTestLine(players, "  [{}] fatigue -> max: {}",
+                    player->RemovePlayerFlag(PLAYER_FLAGS_RESTING);
+                    // `fatigue` is remaining-time now: empty it so the next update
+                    // is at 0 and the player falls asleep (no drain wait).
+                    bool ok = Test_SetFatigue(player, 0);
+                    BroadcastTestLine(players, "  [{}] fatigue -> 0 (sleep): {}",
                         player->GetName(), ok ? "ok" : "FAILED (no fatigue challenge)");
                     if (!ok)
                         run->pass = false;
@@ -732,8 +769,8 @@ namespace CoAChallenges
         // Tracked objectives grouped by the level before which they must be done.
         std::map<uint32, std::vector<Objective>> byLevel;
         for (Objective const& o : GetObjectives(challengeId))
-            if (IsTrackedObjective(o.type) && o.v2)
-                byLevel[o.v2].push_back(o);
+            if (IsTrackedObjective(o.type) && CoAParse::ObjectiveGateLevel(o))
+                byLevel[CoAParse::ObjectiveGateLevel(o)].push_back(o);
         if (byLevel.empty())
             return -1;
         uint32 const gate = byLevel.begin()->first;
@@ -767,7 +804,7 @@ namespace CoAChallenges
             ResetCharacterForTest(p);
             ActivateChallengeForTest(p, challengeId);
             for (Objective const& o : GetObjectives(challengeId))
-                if (IsTrackedObjective(o.type) && o.v2 != gate)
+                if (IsTrackedObjective(o.type) && CoAParse::ObjectiveGateLevel(o) != gate)
                     SetObjectiveDone(guid, challengeId, o.key);
             p->GiveLevel(static_cast<uint8>(gate));   // fires OnPlayerLevelChanged
             bool alive = p->IsAlive();
@@ -789,11 +826,21 @@ namespace CoAChallenges
         for (auto const& [level, objs] : byLevel)
         {
             for (Objective const& o : objs)
+                SatisfyObjectiveForTest(killer, o);
+            for (Player* p : players)
             {
-                Creature* c = killer->SummonCreature(o.v1, *killer,
-                    TEMPSUMMON_TIMED_DESPAWN, 30000);
-                if (c)
-                    Unit::Kill(killer, c);   // CreditKill shares it with the group
+                if (p->GetLevel() >= maxLevel)
+                    continue;
+                uint32 guid = p->GetGUID().GetCounter();
+                bool completedEarly = (bool)CharacterDatabase.Query(
+                    "SELECT 1 FROM coa_challenge_completion WHERE guid = {} AND challengeId = {}",
+                    guid, challengeId);
+                if (completedEarly)
+                {
+                    BroadcastTestLine(players, "  [{}] completed before level cap at level {} (unexpected)",
+                        p->GetName(), p->GetLevel());
+                    pass = false;
+                }
             }
             for (Player* p : players)
                 if (p->GetLevel() < level)
@@ -850,8 +897,10 @@ namespace CoAChallenges
             pass = false;
         if (guildBankAllowed == expectNoGuildBank)
             pass = false;
-        if (expectNoRealmBank)
-            SendTestLine(player, "  NO_REALM_BANK present -> N/A (feature absent on this fork)");
+        bool const realmBankAllowed = AscensionPersonalBank::CanAccess(player, AscensionPersonalBank::REALM);
+        SendTestLine(player, "  Realm bank access -> {} (expected {})", realmBankAllowed, !expectNoRealmBank);
+        if (realmBankAllowed == expectNoRealmBank)
+            pass = false;
 
         // Professions: NO_PROFESSIONS blocks skill-ups; CANNOT_UNLEARN blocks abandon.
         if (hasRule("CHALLENGE_RULES_TYPE_NO_PROFESSIONS"))
@@ -934,17 +983,25 @@ namespace CoAChallenges
         uint32 RuleTestFirstQuestOfColor(Player* player, int colorIdx)
         {
             for (auto const& pair : sObjectMgr->GetQuestTemplates())
-                if (QuestColor(pair.second->GetQuestLevel(), player->GetLevel()) == colorIdx)
+            {
+                int32 const questLevel = pair.second->GetQuestLevel();
+                if (questLevel >= 0 && QuestColor(uint32(questLevel), player->GetLevel()) == colorIdx)
                     return pair.first;
+            }
             return 0;
         }
 
-        uint32 RuleTestFirstFetchQuest()
+        uint32 RuleTestGrantedXP(uint32 amount)
+        {
+            return static_cast<uint32>(std::min(double(amount) * sWorld->getRate(RATE_XP_GLOBAL),
+                double(std::numeric_limits<uint32>::max())));
+        }
+
+        uint32 RuleTestFirstQuest(std::function<bool(Quest const*)> const& matches)
         {
             for (auto const& pair : sObjectMgr->GetQuestTemplates())
-                for (uint32 i = 0; i < QUEST_ITEM_OBJECTIVES_COUNT; ++i)
-                    if (pair.second->RequiredItemId[i])
-                        return pair.first;
+                if (matches(pair.second))
+                    return pair.first;
             return 0;
         }
 
@@ -1005,6 +1062,29 @@ namespace CoAChallenges
                         if (ct && ct->type == CREATURE_TYPE_NON_COMBAT_PET)
                             return uint32(sid);
                     }
+                }
+            }
+            return 0;
+        }
+
+        // First spell that summons a NON-companion creature (combat pet/minion/
+        // totem), used to assert NO_PETS_OR_MINIONS still blocks those.
+        uint32 RuleTestCombatSummonSpell()
+        {
+            uint32 const count = sSpellMgr->GetSpellInfoStoreSize();
+            for (uint32 id = 1; id < count; ++id)
+            {
+                SpellInfo const* si = sSpellMgr->GetSpellInfo(id);
+                if (!si)
+                    continue;
+                for (uint8 e = 0; e < MAX_SPELL_EFFECTS; ++e)
+                {
+                    if (si->Effects[e].Effect != SPELL_EFFECT_SUMMON)
+                        continue;
+                    CreatureTemplate const* ct =
+                        sObjectMgr->GetCreatureTemplate(uint32(si->Effects[e].MiscValue));
+                    if (ct && ct->type != CREATURE_TYPE_NON_COMBAT_PET && ct->type != CREATURE_TYPE_CRITTER)
+                        return id;
                 }
             }
             return 0;
@@ -1168,6 +1248,37 @@ namespace CoAChallenges
         return activeAfterCast && dead && failed;
     }
 
+    // C4 regression (#4234): a buff/proc that re-triggers the marked spell must
+    // not fail the trial. Only the player's own (non-triggered) casts count.
+    bool Test_SpellbindTriggeredDoesNotFail(Player* player)
+    {
+        uint32 cid = RuleTestFindChallenge("CHALLENGE_RULES_TYPE_FAILABLE_SPELLBIND_ROULETTE");
+        if (!cid)
+            return false;
+        TrackSpellbind(player, cid);
+        Test_SpellbindTick(player, 30000);
+        uint32 mark = 0; bool failable = false;
+        if (!Test_SpellbindMark(player, mark, failable) || !mark || !failable)
+        {
+            SendTestLine(player, "  triggered roulette: no mark -> SKIP");
+            return true;
+        }
+        // Triggered (proc) cast of the marked spell: must neither be blocked nor
+        // queue the fail+death pending kill.
+        bool const triggeredBlocked = Test_SpellCheckCastBlocked(player, mark, /*triggered=*/true);
+        Test_SpellbindProcessPending(player);               // would kill if queued
+        bool const alive = player->IsAlive();
+        bool const active = RuleTestChallengeActive(player, cid);
+        uint32 after = 0; bool afterFailable = false;
+        bool const markKept = Test_SpellbindMark(player, after, afterFailable) && after == mark;
+        // `triggeredBlocked` is informational only: CheckCast can return non-OK
+        // for unrelated reasons (target/cooldown) on a synthetic Spell, while the
+        // guard's effect is that no pending kill was queued and the mark survived.
+        SendTestLine(player, "  triggered roulette: triggerCastBlocked={} alive={} active={} markKept={}",
+            triggeredBlocked, alive, active, markKept);
+        return alive && active && markKept;
+    }
+
     // Rules the module actually enforces (kept in sync with the enforcement
     // sites in CoA.Challenges.Scripts.cpp). Used to (a) report declared rules
     // that are NOT implemented and (b) report implemented rules with no gate
@@ -1177,8 +1288,7 @@ namespace CoAChallenges
         static std::set<std::string> const kRules = {
             "CHALLENGE_RULES_TYPE_NO_AUCTIONHOUSE",
             "CHALLENGE_RULES_TYPE_NO_GUILD_BANK",
-            // NOTE: NO_REALM_BANK is declared by the client but not enforced on
-            // this fork (no realm bank feature) - deliberately absent here.
+            "CHALLENGE_RULES_TYPE_NO_REALM_BANK",
             "CHALLENGE_RULES_TYPE_NO_CONVENIENCE_ITEMS",
             "CHALLENGE_RULES_TYPE_NO_ARENA_FINDER",
             "CHALLENGE_RULES_TYPE_NO_BATTLEGROUND_FINDER",
@@ -1209,6 +1319,8 @@ namespace CoAChallenges
             "CHALLENGE_RULES_TYPE_NO_ORANGE_QUESTS",
             "CHALLENGE_RULES_TYPE_NO_RED_QUESTS",
             "CHALLENGE_RULES_TYPE_NO_FETCH_QUEST_EXPERIENCE",
+            "CHALLENGE_RULES_TYPE_COSMETIC_ELITE_ENEMIES",
+            "CHALLENGE_RULES_TYPE_STRICT_CHALLENGE_RESTRICTED_TAPPING",
             "CHALLENGE_RULES_TYPE_NO_TALENTS",
             "CHALLENGE_RULES_TYPE_NO_HEARTHSTONE",
             "CHALLENGE_RULES_TYPE_NO_BONUS_EXPERIENCE",
@@ -1276,6 +1388,10 @@ namespace CoAChallenges
             "CHALLENGE_RULES_TYPE_NO_PORTALS",
             "CHALLENGE_RULES_TYPE_NO_LEAVE_CONTINENT",
             "CHALLENGE_RULES_TYPE_HIGH_RISK_ONLY",
+            "CHALLENGE_RULES_TYPE_NO_CREATURE_LEVEL_SCALING",
+            "CHALLENGE_RULES_TYPE_NO_QUEST_LEVEL_SCALING",
+            "CHALLENGE_RULES_TYPE_NO_PLAYER_LEVEL_SCALING",
+            "CHALLENGE_RULES_TYPE_NO_HIGH_RISK_LOOT",
             // NOTE: FLOOR_IS_LAVA (165 "The Floor is Lava!") is NOT modelled here:
             // its About is "Don't. Stop. Jumping." (damage while grounded), not
             // lava/fire environmental damage, and 165 is challenge-only (custom
@@ -1296,6 +1412,10 @@ namespace CoAChallenges
             "CHALLENGE_CONDITIONS_TYPE_LOOT_INTERACTION",
             "CHALLENGE_CONDITIONS_TYPE_LEVEL_UP",
             "CHALLENGE_CONDITIONS_TYPE_CANNOT_HAVE_GAINED_EXPERIENCE",
+            // Implicit global gates (#4205 family), injected for non-prestige
+            // trials rather than declared in the client data.
+            "CHALLENGE_CONDITIONS_TYPE_TAKE_MAIL_MONEY_OR_ITEM",
+            "CHALLENGE_CONDITIONS_TYPE_OUTSIDE_INTERACTION",
         };
         return kConds;
     }
@@ -1380,6 +1500,9 @@ namespace CoAChallenges
             return !sScriptMgr->OnPlayerCanSendMail(p, ObjectGuid::Empty, ObjectGuid::Empty, s1, s2, 0, 0, nullptr); });
         RUN("CHALLENGE_RULES_TYPE_NO_GUILD_BANK", [](Player* p) {
             return !sScriptMgr->CanGuildSendBankList(p->GetGuild(), p->GetSession(), 0, true); });
+        RUN("CHALLENGE_RULES_TYPE_NO_REALM_BANK", [](Player* p) {
+            return !AscensionPersonalBank::CanAccess(p, AscensionPersonalBank::REALM)
+                && AscensionPersonalBank::CanAccess(p, AscensionPersonalBank::PERSONAL); });
         RUN("CHALLENGE_RULES_TYPE_NO_TRADE", [](Player* p) {
             return !sScriptMgr->OnPlayerCanInitTrade(p, p); });
         RUN("CHALLENGE_RULES_TYPE_NO_CONVENIENCE_ITEMS", [&](Player* p) { return useItem(p, 777998); });
@@ -1395,8 +1518,12 @@ namespace CoAChallenges
             uint32 spell = RuleTestCompanionSpell();
             return spell ? Test_SpellCheckCastBlocked(p, spell) : true; });
         RUN("CHALLENGE_RULES_TYPE_NO_PETS_OR_MINIONS", [](Player* p) {
-            uint32 spell = RuleTestCompanionSpell();
-            return spell ? Test_SpellCheckCastBlocked(p, spell) : true; });
+            // Vanity (non-combat) companions are allowed; combat summons are not.
+            uint32 const companionSpell = RuleTestCompanionSpell();
+            bool const companionAllowed = companionSpell ? !Test_SpellCheckCastBlocked(p, companionSpell) : true;
+            uint32 const combatSpell = RuleTestCombatSummonSpell();
+            bool const combatBlocked = combatSpell ? Test_SpellCheckCastBlocked(p, combatSpell) : true;
+            return companionAllowed && combatBlocked; });
         RUN("CHALLENGE_RULES_TYPE_NO_MANASTORM", [](Player* p) {
             return !sScriptMgr->OnPlayerCanEnterManastorm(p); });
 
@@ -1411,10 +1538,15 @@ namespace CoAChallenges
             return item == 0 && !sScriptMgr->OnPlayerCanSellItem(p, nullptr, nullptr); });
         RUN("CHALLENGE_RULES_TYPE_NO_VENDOR_BUY_FOOD_OR_DRINK", [&](Player* p) {
             ItemTemplate const* food = RuleTestFirstItem(ITEM_CLASS_CONSUMABLE, ITEM_SUBCLASS_FOOD);
-            if (!food) return true;
-            uint32 item = food->ItemId;
-            sScriptMgr->OnPlayerBeforeBuyItemFromVendor(p, ObjectGuid::Empty, 0, item, 1, 0, 0);
-            return item == 0; });
+            uint32 item = 0;
+            if (food)
+            {
+                item = food->ItemId;
+                sScriptMgr->OnPlayerBeforeBuyItemFromVendor(p, ObjectGuid::Empty, 0, item, 1, 0, 0);
+            }
+            uint32 spices = 2678;
+            sScriptMgr->OnPlayerBeforeBuyItemFromVendor(p, ObjectGuid::Empty, 0, spices, 1, 0, 0);
+            return item == 0 && spices == 0; });
         RUN("CHALLENGE_RULES_TYPE_NO_VENDOR_BUYBACK", [&](Player* p) {
             return packetBlocked(p, CMSG_BUYBACK_ITEM, 0); });
         RUN("CHALLENGE_RULES_TYPE_NO_BANK", [&](Player* p) {
@@ -1429,29 +1561,39 @@ namespace CoAChallenges
 
         // ---- 5. XP / profession XP ----
         RUN("CHALLENGE_RULES_TYPE_NO_PROFESSION_EXPERIENCE", [](Player* p) {
-            uint32 gain = 100;
-            sScriptMgr->OnPlayerUpdateCraftingSkill(p, nullptr, 0, gain);
-            return gain == 0; });
+            uint32 craftGain = 1;
+            sScriptMgr->OnPlayerUpdateCraftingSkill(p, nullptr, 0, craftGain);
+            uint32 gatherGain = 1;
+            sScriptMgr->OnPlayerUpdateGatheringSkill(p, SKILL_MINING, 1, 25, 50, 75, gatherGain);
+            uint32 amtProfession = 1000; sScriptMgr->OnPlayerGiveXP(p, amtProfession, nullptr, XPSOURCE_PROFESSION);
+            uint32 amtSkill = 1000; sScriptMgr->OnPlayerGiveXP(p, amtSkill, nullptr, XPSOURCE_PROFESSION_SKILL);
+            uint32 amtKill = 1000; sScriptMgr->OnPlayerGiveXP(p, amtKill, nullptr, XPSOURCE_KILL);
+            return craftGain == 1 && gatherGain == 1 && amtProfession == 0 && amtSkill == 0
+                && amtKill == RuleTestGrantedXP(1000); });
         RUN("CHALLENGE_RULES_TYPE_NO_EXPERIENCE_EXCEPT_QUESTS", [](Player* p) {
             uint32 amt = 1000; sScriptMgr->OnPlayerGiveXP(p, amt, nullptr, XPSOURCE_KILL); return amt == 0; });
         RUN("CHALLENGE_RULES_TYPE_NO_EXPERIENCE_EXCEPT_CREATURES", [](Player* p) {
             uint32 amtQuest = 1000; sScriptMgr->OnPlayerGiveXP(p, amtQuest, nullptr, XPSOURCE_QUEST);
             Creature* c = p->SummonCreature(RuleTestFirstCreature(CREATURE_TYPE_BEAST), *p, TEMPSUMMON_TIMED_DESPAWN, 5000);
             uint32 amtKill = 1000; sScriptMgr->OnPlayerGiveXP(p, amtKill, c, XPSOURCE_KILL);
-            return amtQuest == 0 && amtKill == 1000; });
+            return amtQuest == 0 && amtKill == RuleTestGrantedXP(1000); });
         RUN("CHALLENGE_RULES_TYPE_NO_EXPERIENCE_EXCEPT_PVP", [](Player* p) {
             uint32 amtKill = 1000; sScriptMgr->OnPlayerGiveXP(p, amtKill, nullptr, XPSOURCE_KILL);
             uint32 amtBg = 1000; sScriptMgr->OnPlayerGiveXP(p, amtBg, nullptr, XPSOURCE_BATTLEGROUND);
-            return amtKill == 0 && amtBg == 1000; });
+            return amtKill == 0 && amtBg == RuleTestGrantedXP(1000); });
         RUN("CHALLENGE_RULES_TYPE_NO_EXPERIENCE_EXCEPT_PROFESSIONS", [](Player* p) {
             uint32 amt = 1000; sScriptMgr->OnPlayerGiveXP(p, amt, nullptr, XPSOURCE_KILL); return amt == 0; });
         RUN("CHALLENGE_RULES_TYPE_NO_FETCH_QUEST_EXPERIENCE", [](Player* p) {
-            uint32 qid = RuleTestFirstFetchQuest();
-            Quest const* q = qid ? sObjectMgr->GetQuestTemplate(qid) : nullptr;
-            if (!q) return true;
-            uint32 xp = 1000;
-            sScriptMgr->OnPlayerQuestComputeXP(p, q, xp);
-            return xp == 0; });
+            Quest const* talk = sObjectMgr->GetQuestTemplate(RuleTestFirstQuest(
+                [](Quest const* q) { return IsQuestWithoutObjectives(q); }));
+            Quest const* work = sObjectMgr->GetQuestTemplate(RuleTestFirstQuest(
+                [](Quest const* q) { return q->GetReqItemsCount() && !q->GetReqCreatureOrGOcount(); }));
+            if (!talk || !work) return true;
+            uint32 talkXp = 1000;
+            sScriptMgr->OnPlayerQuestComputeXP(p, talk, talkXp);
+            uint32 workXp = 1000;
+            sScriptMgr->OnPlayerQuestComputeXP(p, work, workXp);
+            return talkXp == 0 && workXp == 1000; });
 
         // ---- 6. Quests (color) ----
         RUN("CHALLENGE_RULES_TYPE_NO_QUESTS", [](Player* p) {
@@ -1556,6 +1698,8 @@ namespace CoAChallenges
             return Test_SpellbindCoexistingSurvives(p); });
         RUN("CHALLENGE_RULES_TYPE_FAILABLE_SPELLBIND_ROULETTE", [](Player* p) {
             return Test_SpellbindFailableKillsOnNextTick(p); });
+        RUN("CHALLENGE_RULES_TYPE_FAILABLE_SPELLBIND_ROULETTE", [](Player* p) {
+            return Test_SpellbindTriggeredDoesNotFail(p); });
 
         // ---- 12. Environment / breath / profession (single-player) ----
         RUN("CHALLENGE_RULES_TYPE_FAILABLE_NO_FALLING", [](Player* p) {
@@ -1706,7 +1850,7 @@ namespace CoAChallenges
             c->SetLevel(higher);
             uint32 high = 1000;
             sScriptMgr->OnPlayerGiveXP(p, high, c, XPSOURCE_KILL);
-            return low == 0 && high == 1000; });
+            return low == 0 && high == RuleTestGrantedXP(1000); });
 
         RUN("CHALLENGE_RULES_TYPE_CAST_RANGE_LIMITED_TO_MELEE", [](Player* p) {
             RefreshRegenTracking(p);   // seed the cached cast-rule mask
@@ -1770,6 +1914,12 @@ namespace CoAChallenges
                 "CHALLENGE_RULES_TYPE_ONLY_PVP_IN_5_LEVEL_RANGE",        // `.coa ruletestparty`
                 "CHALLENGE_RULES_TYPE_ONLY_PVP_SAME_LEVEL_IF_MAX_LEVEL", // `.coa ruletestparty`
                 "CHALLENGE_RULES_TYPE_PVE_ONLY",                          // `.coa ruletestparty`
+                "CHALLENGE_RULES_TYPE_COSMETIC_ELITE_ENEMIES",            // challenges-adventure-mode scenario
+                "CHALLENGE_RULES_TYPE_STRICT_CHALLENGE_RESTRICTED_TAPPING", // challenges-adventure-mode scenario
+                "CHALLENGE_RULES_TYPE_NO_CREATURE_LEVEL_SCALING", // challenges-level-scaling-rules scenario
+                "CHALLENGE_RULES_TYPE_NO_QUEST_LEVEL_SCALING",    // challenges-level-scaling-rules scenario
+                "CHALLENGE_RULES_TYPE_NO_PLAYER_LEVEL_SCALING",   // challenges-level-scaling-rules scenario
+                "CHALLENGE_RULES_TYPE_NO_HIGH_RISK_LOOT",         // challenge-no-high-risk-loot scenario
             };
             std::set<std::string> const& impl = ImplementedRules();
             uint32 missing = 0;
@@ -1799,6 +1949,81 @@ namespace CoAChallenges
 
     // GM-only (`.coa ruletestparty <p1> <p2>`): rules whose check needs a second
     // player (trade/group/PvP range). Both must be online in the open world.
+    // Automated condition-gate tests (`.coa conditiontest <player>`). Exercises
+    // every implemented condition type through the REAL EvaluateConditions, with
+    // a synthetic condition string (no definition declares most of them) and the
+    // implicit OUTSIDE_INTERACTION injection disabled.
+    bool Test_ConditionGates(Player* player)
+    {
+        if (!player)
+            return false;
+
+        Test_SetQuiet(true);
+        uint32 const cid = 188;   // scratch trial id; label/logging only
+        uint32 const guid = player->GetGUID().GetCounter();
+
+        int count = 0, fails = 0;
+        auto RUN = [&](char const* label, char const* cond, bool expectBroken,
+                       std::function<void()> setup)
+        {
+            ResetCharacterForTest(player);
+            if (setup)
+            {
+                setup();
+                WaitCharacterQueueEmpty();   // condition flags are written async
+            }
+            bool broken = false;
+            for (ConditionState const& s : EvaluateConditionsFor(player, cid, cond, false))
+                if (s.broken)
+                    broken = true;
+            bool const ok = (broken == expectBroken);
+            SendTestLine(player, "  {:<46} {} (broken={})", label, ok ? "PASS" : "FAIL", broken);
+            ++count;
+            if (!ok)
+                ++fails;
+        };
+
+        // Historical facets: clean by default, broken once the flag is set.
+        RUN("MAIL clean", "CHALLENGE_CONDITIONS_TYPE_TAKE_MAIL_MONEY_OR_ITEM:0/0/0", false, nullptr);
+        RUN("MAIL flagged", "CHALLENGE_CONDITIONS_TYPE_TAKE_MAIL_MONEY_OR_ITEM:0/0/0", true,
+            [&]{ SetConditionFlag(guid, "OUTSIDE_MAIL"); });
+        RUN("TRADE flagged", "CHALLENGE_CONDITIONS_TYPE_ACCEPT_TRADE:0/0/0", true,
+            [&]{ SetConditionFlag(guid, "OUTSIDE_TRADE"); });
+        RUN("AUCTIONHOUSE flagged", "CHALLENGE_CONDITIONS_TYPE_AUCTIONHOUSE_INTERACTION:0/0/0", true,
+            [&]{ SetConditionFlag(guid, "OUTSIDE_AH"); });
+        RUN("VENDOR flagged", "CHALLENGE_CONDITIONS_TYPE_VENDOR_INTERACTION:0/0/0", true,
+            [&]{ SetConditionFlag(guid, "OUTSIDE_VENDOR"); });
+        RUN("GUILD_BANK flagged", "CHALLENGE_CONDITIONS_TYPE_WITHDRAW_GUILD_BANK_MONEY_OR_ITEM:0/0/0", true,
+            [&]{ SetConditionFlag(guid, "OUTSIDE_GUILD_BANK"); });
+        RUN("BANK flagged", "CHALLENGE_CONDITIONS_TYPE_WITHDRAW_BANK_MONEY_OR_ITEM:0/0/0", true,
+            [&]{ SetConditionFlag(guid, "OUTSIDE_BANK"); });
+        RUN("REALM_BANK flagged", "CHALLENGE_CONDITIONS_TYPE_WITHDRAW_REALM_BANK_MONEY_OR_ITEM:0/0/0", true,
+            [&]{ SetConditionFlag(guid, "OUTSIDE_REALM_BANK"); });
+        RUN("OUTSIDE aggregate clean", "CHALLENGE_CONDITIONS_TYPE_OUTSIDE_INTERACTION:0/0/0", false, nullptr);
+        RUN("OUTSIDE aggregate flagged", "CHALLENGE_CONDITIONS_TYPE_OUTSIDE_INTERACTION:0/0/0", true,
+            [&]{ SetConditionFlag(guid, "OUTSIDE_AH"); });
+        RUN("LOOT flagged", "CHALLENGE_CONDITIONS_TYPE_LOOT_INTERACTION:0/0/0", true,
+            [&]{ SetConditionFlag(guid, "LOOTED"); });
+
+        // Live conditions.
+        RUN("LEVEL_UP at level 1", "CHALLENGE_CONDITIONS_TYPE_LEVEL_UP:0/0/0", false, nullptr);
+        RUN("LEVEL_UP at level 2", "CHALLENGE_CONDITIONS_TYPE_LEVEL_UP:0/0/0", true,
+            [&]{ player->GiveLevel(2); });
+        RUN("TWO_PROFESSIONS none", "CHALLENGE_CONDITIONS_TYPE_HAVE_TWO_PRIMARY_PROFESSIONS:0/0/0", false, nullptr);
+        RUN("TWO_PROFESSIONS two", "CHALLENGE_CONDITIONS_TYPE_HAVE_TWO_PRIMARY_PROFESSIONS:0/0/0", true,
+            [&]{ player->SetSkill(SKILL_ALCHEMY, 0, 1, 75); player->SetSkill(SKILL_BLACKSMITHING, 0, 1, 75); });
+        RUN("GROUP_SIZE:0 solo", "CHALLENGE_CONDITIONS_TYPE_GROUP_SIZE:0/0/0", false, nullptr);
+        RUN("FREE_SLOTS:1", "CHALLENGE_CONDITIONS_TYPE_HAVE_FREE_INVENTORY_SLOTS:1/0/0", false, nullptr);
+
+        // Unimplemented types must fail closed (documented, not silently allowed).
+        RUN("unhandled type blocks", "CHALLENGE_CONDITIONS_TYPE_COMPLETE_CHALLENGE:1/0/0", true, nullptr);
+
+        ResetCharacterForTest(player);
+        Test_SetQuiet(false);
+        SendTestLine(player, "  ---- condition gates: {} run, {} failed ----", count, fails);
+        return fails == 0;
+    }
+
     bool Test_PartyRuleGates(Player* a, Player* b)
     {
         if (!a || !b || a == b)
@@ -1891,6 +2116,7 @@ namespace CoAChallenges
             std::string const rules = ChallengeRules(id);
             bool const declaredMana = rules.find("CHALLENGE_RULES_TYPE_NO_MANASTORM") != std::string::npos;
             bool const declaredGuild = rules.find("CHALLENGE_RULES_TYPE_NO_GUILD_BANK") != std::string::npos;
+            bool const declaredRealm = rules.find("CHALLENGE_RULES_TYPE_NO_REALM_BANK") != std::string::npos;
 
             CharacterDatabase.DirectExecute(
                 "INSERT INTO coa_character_challenge (guid, challengeId, level, deaths) VALUES ({}, {}, 1, 0)",
@@ -1899,15 +2125,17 @@ namespace CoAChallenges
             bool const manaAllowed = sScriptMgr->OnPlayerCanEnterManastorm(player);
             bool const guildAllowed = sScriptMgr->CanGuildSendBankList(
                 player->GetGuild(), player->GetSession(), 0, true);
+            bool const realmAllowed = AscensionPersonalBank::CanAccess(player, AscensionPersonalBank::REALM);
             CharacterDatabase.DirectExecute(
                 "DELETE FROM coa_character_challenge WHERE guid = {} AND challengeId = {}", guid, id);
             ClearCharChallengeCache(guid);
 
-            if (manaAllowed == declaredMana || guildAllowed == declaredGuild)
+            if (manaAllowed == declaredMana || guildAllowed == declaredGuild || realmAllowed == declaredRealm)
             {
                 ++divergences;
-                SendTestLine(player, "  DIVERGENCE id={} declared(NO_MANASTORM={} NO_GUILD_BANK={}) "
-                    "hook(manastorm={} guildBank={})", id, declaredMana, declaredGuild, manaAllowed, guildAllowed);
+                SendTestLine(player, "  DIVERGENCE id={} declared(NO_MANASTORM={} NO_GUILD_BANK={} NO_REALM_BANK={}) "
+                    "hook(manastorm={} guildBank={} realmBank={})", id, declaredMana, declaredGuild, declaredRealm,
+                    manaAllowed, guildAllowed, realmAllowed);
             }
         }
 
@@ -2071,6 +2299,56 @@ namespace CoAChallenges
         return ok;
     }
 
+    // GM-only (`.coa pettest <player>`): regression test for Issue #4343.
+    // Verifies that when a player activates a trial with a trial aura (e.g. Nightmare 61, aura 93132),
+    // any creature/pet summoned by the player receives the trial aura dynamically, and when the trial
+    // is reset, the aura is cleanly removed from both player and summon.
+    bool Test_PetTrialAuras(Player* player)
+    {
+        if (!player || !player->IsInWorld())
+            return false;
+
+        ResetCharacterForTest(player);
+        uint32 const cid = 61; // Nightmare
+        uint32 const expectedAura = 93132;
+        ActivateChallengeForTest(player, cid);
+
+        if (!player->HasAura(expectedAura))
+        {
+            SendTestLine(player, "  pet_trial_auras: player failed to receive trial aura {}", expectedAura);
+            ResetCharacterForTest(player);
+            return false;
+        }
+
+        // Spawn a temporary summon owned by the player
+        Position pos = player->GetPosition();
+        TempSummon* summon = player->GetMap()->SummonCreature(
+            50075, // Generic summonable creature
+            pos, nullptr, 15000, player);
+
+        if (!summon)
+        {
+            SendTestLine(player, "  pet_trial_auras: could not summon test creature");
+            ResetCharacterForTest(player);
+            return false;
+        }
+
+        bool const hasAura = summon->HasAura(expectedAura);
+        SendTestLine(player, "  pet_trial_auras: summon '{}' (GUID {}) aura {} -> {}",
+            summon->GetName(), summon->GetGUID().ToString(), expectedAura, hasAura ? "PASS" : "FAIL");
+
+        // Now test trial reset - aura must be stripped from both player and summon
+        ResetChallengeState(player);
+        bool const playerLost = !player->HasAura(expectedAura);
+        bool const summonLost = !summon->HasAura(expectedAura);
+        SendTestLine(player, "  pet_trial_auras: aura stripped on reset -> player: {}, summon: {}",
+            playerLost ? "PASS" : "FAIL", summonLost ? "PASS" : "FAIL");
+
+        summon->UnSummon();
+        ResetCharacterForTest(player);
+        return hasAura && playerLost && summonLost;
+    }
+
     // GM-only (`.coa auditdefs <player>`): data-integrity sweep over EVERY
     // definition (all ids): rule/condition/objective tokens are known and
     // enforced, aura spells resolve to a SpellInfo, reward items/achievements
@@ -2084,15 +2362,8 @@ namespace CoAChallenges
         std::set<std::string> const& conds = KnownConditions();
 
         // Rules intentionally not enforced server-side, each with the reason.
-        // IMPORTANT: the *_LEVEL_SCALING ones are NOT confirmed covered by the
-        // client - Extensions.dll was not fully reversed beyond the 35 C_Challenge
-        // functions, and the client Lua only reads 4 UI rules. Treat as
-        // "needs further DLL RE" before assuming the client handles them.
         static std::map<std::string, char const*> const kNotApplicable = {
             {"CHALLENGE_RULES_TYPE_NONE", "client export sentinel (empty slot)"},
-            {"CHALLENGE_RULES_TYPE_NO_REALM_BANK", "no realm bank feature on this fork"},
-            {"CHALLENGE_RULES_TYPE_NO_QUEST_LEVEL_SCALING", "no server scaling; needs DLL RE"},
-            {"CHALLENGE_RULES_TYPE_NO_PLAYER_LEVEL_SCALING", "no server scaling; needs DLL RE"},
         };
         std::set<std::string> naSeen;
         uint32 ruleCount = 0, unenforced = 0;

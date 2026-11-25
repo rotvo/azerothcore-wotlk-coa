@@ -16,6 +16,7 @@
  */
 
 #include "AccountMgr.h"
+#include "AscensionBazaarTokenReserve.h"
 #include "Chat.h"
 #include "RBAC.h"
 #include "CharacterCache.h"
@@ -24,6 +25,7 @@
 #include "GameTime.h"
 #include "Item.h"
 #include "Language.h"
+#include "LocalLevelScaling.h"
 #include "Log.h"
 #include "Mail.h"
 #include "MailMgr.h"
@@ -160,7 +162,10 @@ void WorldSession::HandleSendMail(WorldPacket& recvData)
         return;
     }
 
-    uint32 cost = items_count ? 30 * items_count : 30; // price hardcoded in client
+    Player* receive = ObjectAccessor::FindConnectedPlayer(receiverGuid);
+    uint32 const rc_account = receive ? receive->GetSession()->GetAccountId()
+        : sCharacterCache->GetCharacterAccountIdByGuid(receiverGuid);
+    uint32 const cost = GetAccountId() == rc_account ? 0 : (items_count ? 30 * items_count : 30);
 
     uint32 reqmoney = cost + money;
 
@@ -176,8 +181,6 @@ void WorldSession::HandleSendMail(WorldPacket& recvData)
         player->SendMailResult(0, MAIL_SEND, MAIL_ERR_NOT_ENOUGH_MONEY);
         return;
     }
-
-    Player* receive = ObjectAccessor::FindConnectedPlayer(receiverGuid);
 
     uint32 rc_teamId = TEAM_NEUTRAL;
     uint16 mails_count = 0;                                  //do not allow to send to one player more than 100 mails
@@ -219,9 +222,7 @@ void WorldSession::HandleSendMail(WorldPacket& recvData)
         }
     }*/
 
-    uint32 rc_account = receive ? receive->GetSession()->GetAccountId() : sCharacterCache->GetCharacterAccountIdByGuid(receiverGuid);
-
-    if (/*!accountBound*/ GetAccountId() != rc_account && player->GetTeamId() != rc_teamId && !HasPermission(rbac::RBAC_PERM_TWO_SIDE_INTERACTION_MAIL))
+    if (/*!accountBound*/ GetAccountId() != rc_account && !sWorld->getBoolConfig(CONFIG_ALLOW_TWO_SIDE_INTERACTION_MAIL) && player->GetTeamId() != rc_teamId && !HasPermission(rbac::RBAC_PERM_TWO_SIDE_INTERACTION_MAIL))
     {
         player->SendMailResult(0, MAIL_SEND, MAIL_ERR_NOT_YOUR_TEAM);
         return;
@@ -290,6 +291,23 @@ void WorldSession::HandleSendMail(WorldPacket& recvData)
     {
         player->SendMailResult(0, MAIL_SEND, MAIL_ERR_INTERNAL_ERROR);
         return;
+    }
+
+    // Elite Warchest Bazaar Tokens are Realm Bound: free between the account's own characters, otherwise the
+    // account must keep its reserve.
+    if (GetAccountId() != rc_account)
+    {
+        uint32 tokens = 0;
+        for (uint8 i = 0; i < items_count; ++i)
+            if (items[i]->GetEntry() == AscensionBazaarTokenReserve::TOKEN_ITEM)
+                tokens += items[i]->GetCount();
+
+        if (!AscensionBazaarTokenReserve::CanGiveAway(player, tokens))
+        {
+            AscensionBazaarTokenReserve::SendRefusal(player);
+            player->SendMailResult(0, MAIL_SEND, MAIL_ERR_EQUIP_ERROR, EQUIP_ERR_MAIL_BOUND_ITEM);
+            return;
+        }
     }
 
     player->SendMailResult(0, MAIL_SEND, MAIL_OK);
@@ -366,13 +384,14 @@ void WorldSession::HandleSendMail(WorldPacket& recvData)
         COD = 0;
 
     // will delete item or place to receiver mail list
-    draft
+    uint32 const mailId = draft
     .AddMoney(money)
     .AddCOD(COD)
     .SendMailTo(trans, MailReceiver(receive, receiverGuid.GetCounter()), MailSender(player), body.empty() ? MAIL_CHECK_MASK_COPIED : MAIL_CHECK_MASK_HAS_BODY, deliver_delay);
 
     player->SaveInventoryAndGoldToDB(trans);
     CharacterDatabase.CommitTransaction(trans);
+    sScriptMgr->OnPlayerAfterSendMail(player, receiverGuid, rc_account, receiver, mailId, subject, body);
 
     LOG_INFO("entities.player.mail", "Mail: Account: {} (IP: {}), Player [{}] ({}) sent mail to Player [{}] ({}): subject='{}', body='{}', {} copper, {} COD copper, sent item(s) [{}]",
         GetAccountId(), GetRemoteAddress(), player->GetName(), player->GetGUID().GetCounter(),
@@ -608,6 +627,7 @@ void WorldSession::HandleMailTakeItem(WorldPacket& recvData)
         player->m_mailsUpdated = true;
         player->RemoveMItem(it->GetGUID().GetCounter());
 
+        uint32 const itemEntry = it->GetEntry();
         uint32 count = it->GetCount();                      // save counts before store and possible merge with deleting
         it->SetState(ITEM_UNCHANGED);                       // need to set this state, otherwise item cannot be removed later, if neccessary
         player->MoveItemToInventory(dest, it, true);
@@ -623,6 +643,7 @@ void WorldSession::HandleMailTakeItem(WorldPacket& recvData)
         CharacterDatabase.CommitTransaction(trans);
 
         player->SendMailResult(mailId, MAIL_ITEM_TAKEN, MAIL_OK, 0, itemLowGuid, count);
+        sScriptMgr->OnPlayerTakeMailItem(player, m, itemEntry);
     }
     else
         player->SendMailResult(mailId, MAIL_ITEM_TAKEN, MAIL_ERR_EQUIP_ERROR, msg);
@@ -682,6 +703,8 @@ void WorldSession::HandleGetMailList(WorldPacket& recvData)
         return;
 
     Player* player = _player;
+
+    LocalLevelScaling::NotifyMailListed(player);
 
     uint8 mailsCount = 0;
     uint32 realCount = 0;
